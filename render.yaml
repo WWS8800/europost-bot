@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: europost-bot
+    env: node
+    buildCommand: npm install
+    startCommand: node bot.js
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: MORNING_HOUR
+        value: "9"
