@@ -8,403 +8,457 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wkjyymtqhdmwdalhddtn.s
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indranl5bXRxaGRtd2RhbGhkZHRuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwNTk5MzgsImV4cCI6MjA4NzYzNTkzOH0.ljR7uxunFpA2xUf2ij8K942W2E4uTwZrZA3T-aC3FFw';
 const ADMIN_IDS = (process.env.ADMIN_IDS || '6367339097').split(',').map(id => parseInt(id.trim())).filter(Boolean);
 const MORNING_HOUR = parseInt(process.env.MORNING_HOUR || '9');
-
-if (!BOT_TOKEN || !SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('❌ Missing env variables: BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY');
-  process.exit(1);
-}
+const PAGE_SIZE = 10;
 
 // ═══════════════════════════════════════
-// SUPABASE CLIENT
+// SUPABASE
 // ═══════════════════════════════════════
 const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-async function sb(method, table, body = null, params = '') {
+async function sbGet(table, params = '') {
   const url = `${SUPABASE_URL}/rest/v1/${table}${params}`;
   const res = await fetch(url, {
-    method,
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+    }
+  });
+  if (!res.ok) throw new Error(`GET ${table}: ${await res.text()}`);
+  return res.json();
+}
+
+async function sbPost(table, data) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
+    method: 'POST',
     headers: {
       'apikey': SUPABASE_KEY,
       'Authorization': `Bearer ${SUPABASE_KEY}`,
       'Content-Type': 'application/json',
-      'Prefer': method === 'POST' ? 'return=representation' : 'return=representation'
+      'Prefer': 'return=representation'
     },
-    body: body ? JSON.stringify(body) : undefined
+    body: JSON.stringify(data)
   });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`${method} ${table}: ${err}`);
-  }
-  return method === 'DELETE' ? [] : res.json();
+  if (!res.ok) throw new Error(`POST ${table}: ${await res.text()}`);
+  return res.json();
 }
 
-const db = {
-  get: (table, params = '') => sb('GET', table, null, params),
-  insert: (table, data) => sb('POST', table, data),
-  update: (table, id, data, col = 'id') => sb('PATCH', table, data, `?${col}=eq.${id}`),
-  delete: (table, id, col = 'id') => sb('DELETE', table, null, `?${col}=eq.${id}`)
-};
-
-// ═══════════════════════════════════════
-// STATUS MAPS
-// ═══════════════════════════════════════
-const STATUS = {
-  issued:    { l: '📋 Видана адреса',        next: 'ordered' },
-  ordered:   { l: '📦 Замовлено (є трек)',   next: 'warehouse' },
-  warehouse: { l: '🏭 На складі ЄС',         next: 'address' },
-  address:   { l: '🏠 Отримано на адресі',   next: 'carrier' },
-  carrier:   { l: '🚐 Передано перевізнику', next: 'np_sent' },
-  np_sent:   { l: '📮 Відправлено НП',        next: 'ua' },
-  ua:        { l: '🇺🇦 В UA',                next: 'delivered' },
-  delivered: { l: '✅ Доставлено',            next: null },
-  cancelled: { l: '❌ Скасовано',             next: null },
-  legit:     { l: '👑 Легіт',                next: null },
-};
+async function sbPatch(table, id, data, col = 'id') {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${col}=eq.${id}`, {
+    method: 'PATCH',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+      'Prefer': 'return=representation'
+    },
+    body: JSON.stringify(data)
+  });
+  if (!res.ok) throw new Error(`PATCH ${table}: ${await res.text()}`);
+  return res.json();
+}
 
 // ═══════════════════════════════════════
 // HELPERS
 // ═══════════════════════════════════════
-const td = () => new Date().toISOString().split('T')[0];
+const td = () => new Date().toLocaleDateString('uk-UA').split('.').reverse().join('-');
 const isAdmin = (id) => ADMIN_IDS.includes(id);
 
-function fmt(p, clients = [], carriers = []) {
-  const cl = clients.find(c => c.id === p.client_id) || { name: '?' };
-  const cr = carriers.find(c => c.id === p.carrier_id) || { name: '—' };
-  const st = STATUS[p.status] || { l: p.status };
-  const paid1 = p.paid1 ? '✅' : '❌';
-  const paid2 = p.paid2 ? '✅' : '❌';
-  return [
-    `📦 *${p.id}*`,
-    `👤 ${cl.name}${cl.tg ? ' · ' + cl.tg : ''}`,
-    `🏪 ${p.shop}${p.description ? ' · ' + p.description : ''}`,
-    `📊 ${st.l}`,
-    p.track ? `🔍 \`${p.track}\`` : '',
-    `📅 Замовлено: ${p.date}${p.recv_date ? ' · Отримано: ' + p.recv_date : ''}`,
-    `💰 Послуга: €${p.price} ${paid1} · Перевезення: €${p.ship_cost || 0} ${paid2}`,
-    cr.name !== '—' ? `🚐 ${cr.name}` : '',
-    p.recv_data ? `📍 ${p.recv_data}` : '',
-    p.deliv_date ? `🎯 Доставлено: ${p.deliv_date}` : '',
-    p.note ? `📝 ${p.note}` : '',
-  ].filter(Boolean).join('\n');
+// Safe markdown - escape special chars for Markdown (not V2)
+function safe(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/\*/g, '\\*')
+    .replace(/_/g, '\\_')
+    .replace(/`/g, '\\`')
+    .replace(/\[/g, '\\[');
 }
 
-function parcelButtons(p) {
-  const btns = [];
-  const st = STATUS[p.status];
+const STATUS = {
+  issued:    { l: 'Видана адреса',        e: '📋' },
+  ordered:   { l: 'Замовлено',            e: '📦' },
+  warehouse: { l: 'На складі ЄС',         e: '🏭' },
+  address:   { l: 'На адресі',            e: '🏠' },
+  carrier:   { l: 'У перевізника',        e: '🚐' },
+  np_sent:   { l: 'Відправлено НП',       e: '📮' },
+  ua:        { l: 'В Україні',            e: '🇺🇦' },
+  delivered: { l: 'Доставлено',           e: '✅' },
+  cancelled: { l: 'Скасовано',            e: '❌' },
+  legit:     { l: 'Легіт',               e: '👑' },
+};
 
-  if (st?.next) {
-    btns.push(Markup.button.callback(`▶ ${STATUS[st.next]?.l || st.next}`, `next_${p.id}`));
+const STATUS_FLOW = ['issued','ordered','warehouse','address','carrier','np_sent','ua','delivered'];
+
+function getNextStatus(current) {
+  const idx = STATUS_FLOW.indexOf(current);
+  if (idx >= 0 && idx < STATUS_FLOW.length - 1) return STATUS_FLOW[idx + 1];
+  return null;
+}
+
+function fmtParcel(p, clients = [], carriers = []) {
+  const cl = clients.find(c => c.id === p.client_id) || { name: '?' };
+  const cr = carriers.find(c => c.id === p.carrier_id) || { name: '' };
+  const st = STATUS[p.status] || { l: p.status, e: '📦' };
+  const lines = [
+    `*${p.id}*`,
+    `${st.e} ${st.l}`,
+    `👤 ${safe(cl.name)}`,
+    `🏪 ${safe(p.shop)}${p.description ? ' — ' + safe(p.description) : ''}`,
+    p.track ? `🔍 \`${p.track}\`` : null,
+    `📅 ${p.date}${p.recv_date ? ' | Отримано: ' + p.recv_date : ''}`,
+    `💰 Послуга: €${p.price} ${p.paid1 ? '✅' : '❌'}`,
+    `🚐 Перевезення: €${p.ship_cost || 0} ${p.paid2 ? '✅' : '❌'}`,
+    cr.name ? `🏢 ${safe(cr.name)}` : null,
+    p.recv_data ? `📍 ${safe(p.recv_data)}` : null,
+    p.deliv_date ? `🎯 Доставлено: ${p.deliv_date}` : null,
+    p.note ? `📝 ${safe(p.note)}` : null,
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
+function parcelActions(p) {
+  const rows = [];
+  const next = getNextStatus(p.status);
+  if (next) {
+    const ns = STATUS[next];
+    rows.push([Markup.button.callback(`▶ ${ns.e} ${ns.l}`, `next_${p.id}`)]);
   }
-  if (!p.paid1) btns.push(Markup.button.callback(`💰 Оплата послуги €${p.price}`, `pay1_${p.id}`));
-  if (!p.paid2 && p.ship_cost > 0) btns.push(Markup.button.callback(`🚐 Оплата переїзду €${p.ship_cost}`, `pay2_${p.id}`));
-  if (p.status !== 'cancelled') btns.push(Markup.button.callback('🚫 Скасувати', `cancel_${p.id}`));
-  btns.push(Markup.button.callback('🔄 Оновити', `view_${p.id}`));
+  const payRow = [];
+  if (!p.paid1) payRow.push(Markup.button.callback(`💰 Оплата €${p.price}`, `pay1_${p.id}`));
+  if (!p.paid2 && p.ship_cost > 0) payRow.push(Markup.button.callback(`🚐 Перевезення €${p.ship_cost}`, `pay2_${p.id}`));
+  if (payRow.length) rows.push(payRow);
 
-  return Markup.inlineKeyboard(btns.reduce((rows, btn, i) => {
-    if (i % 2 === 0) rows.push([]);
-    rows[rows.length - 1].push(btn);
-    return rows;
-  }, []));
+  // Add ship cost button if not set
+  if (!p.ship_cost || p.ship_cost === 0) {
+    rows.push([Markup.button.callback('➕ Додати вартість перевезення', `addship_${p.id}`)]);
+  }
+
+  if (!['cancelled','delivered','legit'].includes(p.status)) {
+    rows.push([Markup.button.callback('🚫 Скасувати', `cancel_${p.id}`)]);
+  }
+  rows.push([
+    Markup.button.callback('🔄 Оновити', `view_${p.id}`),
+    Markup.button.callback('« Назад', 'back_main')
+  ]);
+  return Markup.inlineKeyboard(rows);
 }
 
 // ═══════════════════════════════════════
-// BOT INIT
+// BOT
 // ═══════════════════════════════════════
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(session());
 
-function initSession(ctx) {
+function sess(ctx) {
   if (!ctx.session) ctx.session = {};
   return ctx.session;
 }
 
-// ═══════════════════════════════════════
-// MAIN MENU
-// ═══════════════════════════════════════
 function mainMenu() {
   return Markup.keyboard([
     ['📦 Нова посилка', '🔍 Знайти посилку'],
-    ['👥 Клієнти',      '🗂️ Грязні адреси'],
+    ['👥 Клієнти',      '🗂 Грязні адреси'],
     ['📊 Звіт',         '💰 Боржники'],
-    ['⚙️ Налаштування'],
   ]).resize();
 }
 
+// ═══════════════════════════════════════
+// START
+// ═══════════════════════════════════════
 bot.start(async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('⛔ Доступ заборонено. Зверніться до адміністратора.');
-  }
-  initSession(ctx).step = null;
-  await ctx.reply(
-    `👋 Привіт, ${ctx.from.first_name}!\n\nEuroPost CRM — панель управління.`,
-    { ...mainMenu() }
-  );
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Доступ заборонено.');
+  sess(ctx).step = null;
+  await ctx.reply(`Привіт, ${ctx.from.first_name}!\n\nEuroPost CRM — панель управління.`, mainMenu());
 });
 
 // ═══════════════════════════════════════
-// PARCEL SEARCH — by ID or track
+// BACK BUTTON
 // ═══════════════════════════════════════
-bot.hears('🔍 Знайти посилку', async (ctx) => {
+bot.action('back_main', async (ctx) => {
+  await ctx.answerCbQuery();
+  sess(ctx).step = null;
+  try { await ctx.deleteMessage(); } catch(e) {}
+  await ctx.reply('Головне меню:', mainMenu());
+});
+
+bot.action('back_clients', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showClients(ctx, 0);
+});
+
+bot.action(/^back_parcels_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const cId = parseInt(ctx.match[1]);
+  await showClientParcels(ctx, cId, 0);
+});
+
+// ═══════════════════════════════════════
+// CLIENTS — paginated list
+// ═══════════════════════════════════════
+bot.hears('👥 Клієнти', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
-  initSession(ctx).step = 'search_parcel';
-  await ctx.reply('🔍 Введіть ID посилки (EU-XXXXXX) або tracking номер:', Markup.forceReply());
+  await showClients(ctx, 0);
+});
+
+async function showClients(ctx, page) {
+  try {
+    const clients = await sbGet('clients', '?order=name&select=id,name,phone,tg');
+    const total = clients.length;
+    const start = page * PAGE_SIZE;
+    const slice = clients.slice(start, start + PAGE_SIZE);
+
+    const rows = slice.map(c =>
+      [Markup.button.callback(
+        `${c.name}${c.tg ? ' ' + c.tg : ''}`,
+        `cl_${c.id}`
+      )]
+    );
+
+    // Pagination
+    const navRow = [];
+    if (page > 0) navRow.push(Markup.button.callback('« Назад', `clpage_${page - 1}`));
+    if (start + PAGE_SIZE < total) navRow.push(Markup.button.callback('Далі »', `clpage_${page + 1}`));
+    if (navRow.length) rows.push(navRow);
+    rows.push([Markup.button.callback('« Головне меню', 'back_main')]);
+
+    const text = `Клієнти (${total})\nСторінка ${page + 1} з ${Math.ceil(total / PAGE_SIZE) || 1}:`;
+
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(text, Markup.inlineKeyboard(rows));
+    } else {
+      await ctx.reply(text, Markup.inlineKeyboard(rows));
+    }
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
+}
+
+bot.action(/^clpage_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await showClients(ctx, parseInt(ctx.match[1]));
+});
+
+bot.action(/^cl_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const cId = parseInt(ctx.match[1]);
+  await showClientParcels(ctx, cId, 0);
 });
 
 // ═══════════════════════════════════════
-// QUICK VIEW — user types EU-XXXXXX directly
+// CLIENT PARCELS — paginated
 // ═══════════════════════════════════════
+async function showClientParcels(ctx, cId, page) {
+  try {
+    const [clients, allParcels] = await Promise.all([
+      sbGet('clients', `?id=eq.${cId}&select=id,name,tg,phone`),
+      sbGet('parcels', `?client_id=eq.${cId}&order=date.desc`)
+    ]);
+    const cl = clients[0];
+    if (!cl) return ctx.reply('Клієнта не знайдено');
+
+    const total = allParcels.length;
+    const start = page * PAGE_SIZE;
+    const slice = allParcels.slice(start, start + PAGE_SIZE);
+
+    const rows = slice.map(p => {
+      const st = STATUS[p.status] || { e: '📦', l: p.status };
+      return [Markup.button.callback(
+        `${st.e} ${p.id} — ${p.shop}`,
+        `view_${p.id}`
+      )];
+    });
+
+    // Pagination
+    const navRow = [];
+    if (page > 0) navRow.push(Markup.button.callback('« Назад', `cppage_${cId}_${page - 1}`));
+    if (start + PAGE_SIZE < total) navRow.push(Markup.button.callback('Далі »', `cppage_${cId}_${page + 1}`));
+    if (navRow.length) rows.push(navRow);
+    rows.push([Markup.button.callback('« До клієнтів', 'back_clients')]);
+
+    const text = `👤 ${cl.name}${cl.tg ? ' ' + cl.tg : ''}\n📞 ${cl.phone || 'немає'}\n\nПосилок: ${total}\nСторінка ${page + 1} з ${Math.ceil(total / PAGE_SIZE) || 1}:`;
+
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(text, Markup.inlineKeyboard(rows));
+    } else {
+      await ctx.reply(text, Markup.inlineKeyboard(rows));
+    }
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
+}
+
+bot.action(/^cppage_(\d+)_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await showClientParcels(ctx, parseInt(ctx.match[1]), parseInt(ctx.match[2]));
+});
+
+// ═══════════════════════════════════════
+// VIEW PARCEL
+// ═══════════════════════════════════════
+bot.action(/^view_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await showParcel(ctx, ctx.match[1]);
+});
+
 bot.hears(/^EU-\d+/i, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
-  const id = ctx.message.text.trim().toUpperCase();
-  await showParcel(ctx, id);
+  await showParcel(ctx, ctx.message.text.trim().toUpperCase());
 });
 
 async function showParcel(ctx, id) {
   try {
     const [parcels, clients, carriers] = await Promise.all([
-      db.get('parcels', `?id=eq.${id}`),
-      db.get('clients', '?select=id,name,tg'),
-      db.get('carriers', '?select=id,name'),
+      sbGet('parcels', `?id=eq.${id}`),
+      sbGet('clients', '?select=id,name,tg'),
+      sbGet('carriers', '?select=id,name'),
     ]);
     const p = parcels[0];
-    if (!p) return ctx.reply(`❌ Посилку ${id} не знайдено`);
-    await ctx.reply(fmt(p, clients, carriers), { parse_mode: 'Markdown', ...parcelButtons(p) });
+    if (!p) return ctx.reply(`Посилку ${id} не знайдено`);
+
+    const text = fmtParcel(p, clients, carriers);
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(text, { parse_mode: 'Markdown', ...parcelActions(p) });
+    } else {
+      await ctx.reply(text, { parse_mode: 'Markdown', ...parcelActions(p) });
+    }
   } catch (e) {
-    ctx.reply('❌ Помилка: ' + e.message);
+    const msg = 'Помилка: ' + e.message;
+    if (ctx.callbackQuery) ctx.editMessageText(msg);
+    else ctx.reply(msg);
   }
 }
 
 // ═══════════════════════════════════════
-// ADD PARCEL — step by step dialog
-// ═══════════════════════════════════════
-bot.hears('📦 Нова посилка', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  const sess = initSession(ctx);
-  sess.step = 'parcel_client';
-  sess.newParcel = {};
-
-  try {
-    const clients = await db.get('clients', '?status=eq.active&select=id,name,tg&order=name');
-    sess.clients = clients;
-
-    const btns = clients.slice(0, 20).map(c =>
-      [Markup.button.callback(c.name + (c.tg ? ` ${c.tg}` : ''), `pc_${c.id}`)]
-    );
-    btns.push([Markup.button.callback('➕ Новий клієнт', 'pc_new')]);
-
-    await ctx.reply('👤 Оберіть клієнта:', Markup.inlineKeyboard(btns));
-  } catch (e) {
-    ctx.reply('❌ Помилка: ' + e.message);
-  }
-});
-
-// Client selected
-bot.action(/^pc_(\d+)$/, async (ctx) => {
-  const sess = initSession(ctx);
-  const cId = parseInt(ctx.match[1]);
-  sess.newParcel.client_id = cId;
-  sess.step = 'parcel_addr';
-  await ctx.answerCbQuery();
-
-  try {
-    const addrs = await db.get('addresses', '?status=eq.free&select=id,name,street,house,city');
-    sess.addresses = addrs;
-    const btns = addrs.map(a =>
-      [Markup.button.callback(`${a.name} · ${a.street} ${a.house}, ${a.city}`, `pa_${a.id}`)]
-    );
-    await ctx.editMessageText('📍 Оберіть адресу ЄС:', Markup.inlineKeyboard(btns));
-  } catch (e) { ctx.reply('❌ ' + e.message); }
-});
-
-// Address selected
-bot.action(/^pa_(\d+)$/, async (ctx) => {
-  const sess = initSession(ctx);
-  sess.newParcel.addr_id = parseInt(ctx.match[1]);
-  sess.step = 'parcel_shop';
-  await ctx.answerCbQuery();
-
-  const shops = ['Amazon', 'Aliexpress', 'About You', 'Zalando', 'H&M', 'Zara', 'eBay', 'ASOS'];
-  const btns = shops.reduce((rows, s, i) => {
-    if (i % 3 === 0) rows.push([]);
-    rows[rows.length - 1].push(Markup.button.callback(s, `ps_${s}`));
-    return rows;
-  }, []);
-  btns.push([Markup.button.callback('✏️ Інший магазин', 'ps_other')]);
-
-  await ctx.editMessageText('🏪 Оберіть магазин:', Markup.inlineKeyboard(btns));
-});
-
-// Shop selected from buttons
-bot.action(/^ps_(.+)$/, async (ctx) => {
-  const sess = initSession(ctx);
-  const shop = ctx.match[1];
-  await ctx.answerCbQuery();
-
-  if (shop === 'other') {
-    sess.step = 'parcel_shop_text';
-    await ctx.editMessageText('🏪 Введіть назву магазину:');
-    return;
-  }
-
-  sess.newParcel.shop = shop;
-  sess.step = 'parcel_track';
-  await ctx.editMessageText(`🏪 Магазин: *${shop}*\n\n🔍 Введіть tracking номер (або натисніть /skip):`, { parse_mode: 'Markdown' });
-});
-
-// Price step after track
-async function askPrice(ctx) {
-  const sess = initSession(ctx);
-  sess.step = 'parcel_price';
-  await ctx.reply('💰 Вартість послуги €?\n(тільки число, наприклад: 35)');
-}
-
-// ═══════════════════════════════════════
-// INLINE CALLBACKS — next status, pay, cancel
+// PARCEL ACTIONS
 // ═══════════════════════════════════════
 bot.action(/^next_(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('⛔ Немає доступу');
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('Немає доступу');
   const id = ctx.match[1];
   try {
-    const parcels = await db.get('parcels', `?id=eq.${id}`);
+    const parcels = await sbGet('parcels', `?id=eq.${id}`);
     const p = parcels[0];
-    if (!p) return ctx.answerCbQuery('❌ Не знайдено');
-
-    const st = STATUS[p.status];
-    if (!st?.next) return ctx.answerCbQuery('✅ Фінальний статус');
-
-    const upd = { status: st.next };
-    if (st.next === 'delivered') upd.deliv_date = td();
-
-    await db.update('parcels', id, upd);
-    await ctx.answerCbQuery(`✅ ${STATUS[st.next]?.l}`);
+    if (!p) return ctx.answerCbQuery('Не знайдено');
+    const next = getNextStatus(p.status);
+    if (!next) return ctx.answerCbQuery('Фінальний статус');
+    const upd = { status: next };
+    if (next === 'delivered') upd.deliv_date = td();
+    await sbPatch('parcels', id, upd);
+    await ctx.answerCbQuery(`${STATUS[next].e} ${STATUS[next].l}`);
     await showParcel(ctx, id);
-  } catch (e) { ctx.answerCbQuery('❌ ' + e.message); }
+  } catch (e) { ctx.answerCbQuery('Помилка: ' + e.message); }
 });
 
 bot.action(/^pay1_(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('⛔');
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('Немає доступу');
   const id = ctx.match[1];
   try {
-    const parcels = await db.get('parcels', `?id=eq.${id}`);
+    const parcels = await sbGet('parcels', `?id=eq.${id}`);
     const p = parcels[0];
-    if (!p) return ctx.answerCbQuery('❌ Не знайдено');
-
-    await db.update('parcels', id, { paid1: true });
-
-    // Auto-create transaction
-    const clients = await db.get('clients', `?id=eq.${p.client_id}&select=name`);
+    if (!p) return ctx.answerCbQuery('Не знайдено');
+    await sbPatch('parcels', id, { paid1: true });
+    const clients = await sbGet('clients', `?id=eq.${p.client_id}&select=name`);
     const cl = clients[0] || { name: '?' };
-    await db.insert('transactions', {
+    await sbPost('transactions', {
       date: td(), type: 'income',
       description: `Оплата послуги ${id}`,
       party: cl.name, parcel_ids: [id],
       amount: p.price, method: 'Переказ'
     });
-
-    await ctx.answerCbQuery(`💰 Оплату €${p.price} зараховано`);
+    await ctx.answerCbQuery(`Оплату €${p.price} зараховано`);
     await showParcel(ctx, id);
-  } catch (e) { ctx.answerCbQuery('❌ ' + e.message); }
+  } catch (e) { ctx.answerCbQuery('Помилка: ' + e.message); }
 });
 
 bot.action(/^pay2_(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('⛔');
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('Немає доступу');
   const id = ctx.match[1];
   try {
-    const parcels = await db.get('parcels', `?id=eq.${id}`);
+    const parcels = await sbGet('parcels', `?id=eq.${id}`);
     const p = parcels[0];
-    if (!p) return ctx.answerCbQuery('❌ Не знайдено');
-
-    await db.update('parcels', id, { paid2: true });
+    if (!p) return ctx.answerCbQuery('Не знайдено');
+    await sbPatch('parcels', id, { paid2: true });
     if (p.ship_cost > 0) {
-      const clients = await db.get('clients', `?id=eq.${p.client_id}&select=name`);
+      const clients = await sbGet('clients', `?id=eq.${p.client_id}&select=name`);
       const cl = clients[0] || { name: '?' };
-      await db.insert('transactions', {
+      await sbPost('transactions', {
         date: td(), type: 'income',
         description: `Оплата перевезення ${id}`,
         party: cl.name, parcel_ids: [id],
         amount: p.ship_cost, method: 'Переказ'
       });
     }
-    await ctx.answerCbQuery(`🚐 Перевезення €${p.ship_cost || 0} оплачено`);
+    await ctx.answerCbQuery(`Перевезення оплачено`);
     await showParcel(ctx, id);
-  } catch (e) { ctx.answerCbQuery('❌ ' + e.message); }
+  } catch (e) { ctx.answerCbQuery('Помилка: ' + e.message); }
+});
+
+bot.action(/^addship_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = ctx.match[1];
+  sess(ctx).step = `addship_${id}`;
+  await ctx.reply(`Введіть вартість перевезення для ${id} (тільки число, наприклад: 25):`);
 });
 
 bot.action(/^cancel_(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('⛔');
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('Немає доступу');
   const id = ctx.match[1];
   try {
-    await db.update('parcels', id, { status: 'cancelled' });
-    await ctx.answerCbQuery('❌ Посилку скасовано');
+    await sbPatch('parcels', id, { status: 'cancelled' });
+    await ctx.answerCbQuery('Посилку скасовано');
     await showParcel(ctx, id);
-  } catch (e) { ctx.answerCbQuery('❌ ' + e.message); }
-});
-
-bot.action(/^view_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  await showParcel(ctx, ctx.match[1]);
+  } catch (e) { ctx.answerCbQuery('Помилка: ' + e.message); }
 });
 
 // ═══════════════════════════════════════
-// REPORTS
+// SEARCH
+// ═══════════════════════════════════════
+bot.hears('🔍 Знайти посилку', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  sess(ctx).step = 'search';
+  await ctx.reply('Введіть ID посилки (EU-XXXXXX) або tracking номер:');
+});
+
+// ═══════════════════════════════════════
+// REPORT
 // ═══════════════════════════════════════
 bot.hears('📊 Звіт', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   try {
-    const [parcels, clients] = await Promise.all([
-      db.get('parcels', '?order=date.desc'),
-      db.get('clients', '?select=id,name,tg')
-    ]);
+    const parcels = await sbGet('parcels', '?select=status,date,price,ship_cost,paid1,paid2,client_id');
+    const today = new Date().toISOString().split('T')[0];
 
-    const today = td();
-    const todayP = parcels.filter(p => p.date === today);
     const byStatus = {};
     parcels.forEach(p => { byStatus[p.status] = (byStatus[p.status] || 0) + 1; });
 
     const revService = parcels.filter(p => p.paid1).reduce((s, p) => s + (p.price || 0), 0);
     const revShip = parcels.filter(p => p.paid2).reduce((s, p) => s + (p.ship_cost || 0), 0);
-    const pending = parcels.filter(p => !p.paid1 && p.status !== 'cancelled').reduce((s, p) => s + (p.price || 0), 0);
-    const pendShip = parcels.filter(p => !p.paid2 && p.ship_cost > 0 && p.status !== 'cancelled').reduce((s, p) => s + (p.ship_cost || 0), 0);
+    const pendService = parcels.filter(p => !p.paid1 && p.status !== 'cancelled').reduce((s, p) => s + (p.price || 0), 0);
+    const pendShip = parcels.filter(p => !p.paid2 && (p.ship_cost || 0) > 0 && p.status !== 'cancelled').reduce((s, p) => s + (p.ship_cost || 0), 0);
 
-    const debtors = {};
+    const debtMap = {};
     parcels.filter(p => p.status !== 'cancelled').forEach(p => {
       const owes = (p.paid1 ? 0 : (p.price || 0)) + (p.paid2 ? 0 : (p.ship_cost || 0));
-      if (owes > 0) debtors[p.client_id] = (debtors[p.client_id] || 0) + owes;
+      if (owes > 0) debtMap[p.client_id] = (debtMap[p.client_id] || 0) + owes;
     });
-
-    const top3 = Object.entries(debtors)
-      .sort((a, b) => b[1] - a[1]).slice(0, 3)
-      .map(([cid, amt]) => {
-        const cl = clients.find(c => c.id === parseInt(cid)) || { name: '?' };
-        return `  • ${cl.name} — €${amt}`;
-      }).join('\n');
 
     const statusLines = Object.entries(STATUS)
       .filter(([k]) => byStatus[k])
-      .map(([k, v]) => `  ${v.l}: ${byStatus[k] || 0}`)
+      .map(([k, v]) => `${v.e} ${v.l}: ${byStatus[k]}`)
       .join('\n');
 
-    const msg = `📊 *Зведення EuroPost*
-📅 ${new Date().toLocaleDateString('uk-UA')}
+    const msg = [
+      'Зведення EuroPost',
+      new Date().toLocaleDateString('uk-UA'),
+      '',
+      'Посилки:',
+      `Всього: ${parcels.length}`,
+      statusLines,
+      '',
+      'Фінанси:',
+      `Отримано: €${revService + revShip}`,
+      `Очікується послуги: €${pendService}`,
+      `Очікується перевезення: €${pendShip}`,
+      '',
+      `Боржників: ${Object.keys(debtMap).length}`,
+    ].join('\n');
 
-📦 *Посилки:*
-  Всього: ${parcels.length}
-  Сьогодні нових: ${todayP.length}
-
-${statusLines}
-
-💰 *Фінанси:*
-  ✅ Отримано: €${revService + revShip}
-  ⏳ Очікується: €${pending + pendShip}
-    (послуги €${pending} + перевезення €${pendShip})
-
-⚠️ *Топ боржників:*
-${top3 || '  Боржників немає 🎉'}`;
-
-    await ctx.reply(msg, { parse_mode: 'Markdown' });
-  } catch (e) {
-    ctx.reply('❌ Помилка: ' + e.message);
-  }
+    await ctx.reply(msg);
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
 });
 
 // ═══════════════════════════════════════
@@ -414,8 +468,8 @@ bot.hears('💰 Боржники', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   try {
     const [parcels, clients] = await Promise.all([
-      db.get('parcels', '?status=neq.cancelled&select=client_id,price,ship_cost,paid1,paid2'),
-      db.get('clients', '?select=id,name,tg,phone')
+      sbGet('parcels', '?status=neq.cancelled&select=client_id,price,ship_cost,paid1,paid2'),
+      sbGet('clients', '?select=id,name,tg,phone')
     ]);
 
     const debtMap = {};
@@ -424,259 +478,352 @@ bot.hears('💰 Боржники', async (ctx) => {
       if (owes > 0) debtMap[p.client_id] = (debtMap[p.client_id] || 0) + owes;
     });
 
-    const sorted = Object.entries(debtMap)
-      .sort((a, b) => b[1] - a[1])
-      .map(([cid, amt]) => {
-        const cl = clients.find(c => c.id === parseInt(cid)) || { name: '?' };
-        return `💸 *${cl.name}* — €${amt}\n  ${cl.tg || ''} ${cl.phone || ''}`;
-      });
+    const sorted = Object.entries(debtMap).sort((a, b) => b[1] - a[1]);
+    if (!sorted.length) return ctx.reply('Боржників немає!');
 
-    if (!sorted.length) return ctx.reply('🎉 Боржників немає!');
+    const total = sorted.reduce((s, [, v]) => s + v, 0);
 
-    const total = Object.values(debtMap).reduce((s, v) => s + v, 0);
-    const msg = `💰 *Боржники (${sorted.length})*\nЗагалом: €${total}\n\n${sorted.join('\n\n')}`;
-    await ctx.reply(msg, { parse_mode: 'Markdown' });
-  } catch (e) {
-    ctx.reply('❌ ' + e.message);
-  }
+    // Split into chunks to avoid message length limit
+    const lines = [`Боржники: ${sorted.length}`, `Загалом: €${total}`, ''];
+    sorted.forEach(([cid, amt]) => {
+      const cl = clients.find(c => c.id === parseInt(cid)) || { name: '?' };
+      lines.push(`${cl.name} — €${amt}`);
+      if (cl.tg || cl.phone) lines.push(`  ${cl.tg || ''} ${cl.phone || ''}`.trim());
+      lines.push('');
+    });
+
+    // Send in chunks of 30 lines to avoid limit
+    const chunk = 30;
+    for (let i = 0; i < lines.length; i += chunk) {
+      await ctx.reply(lines.slice(i, i + chunk).join('\n'));
+    }
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
 });
 
 // ═══════════════════════════════════════
-// DIRTY ADDRESSES — quick add
+// DIRTY ADDRESSES
 // ═══════════════════════════════════════
-bot.hears('🗂️ Грязні адреси', async (ctx) => {
+bot.hears('🗂 Грязні адреси', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
-  await ctx.reply(
-    '🗂️ *Грязні адреси*\n\nОберіть дію:',
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('➕ Додати запис', 'da_add')],
-        [Markup.button.callback('🔍 Перевірити адресу', 'da_check')],
-        [Markup.button.callback('📋 Останні 10 записів', 'da_list')],
-      ])
-    }
-  );
+  await ctx.reply('Грязні адреси:', Markup.inlineKeyboard([
+    [Markup.button.callback('➕ Додати запис', 'da_add')],
+    [Markup.button.callback('🔍 Перевірити адресу', 'da_check')],
+    [Markup.button.callback('📋 Останні 10 записів', 'da_list')],
+    [Markup.button.callback('« Назад', 'back_main')],
+  ]));
 });
 
 bot.action('da_add', async (ctx) => {
   await ctx.answerCbQuery();
-  initSession(ctx).step = 'dirty_addr';
-  initSession(ctx).newDirty = {};
-  await ctx.reply('📍 Введіть адресу (наприклад: Maria Basov Breslauer Straße 44a):');
+  sess(ctx).step = 'dirty_addr';
+  sess(ctx).newDirty = {};
+  await ctx.editMessageText('Введіть адресу (наприклад: Maria Basov Breslauer Strasse 44a):');
 });
 
 bot.action('da_check', async (ctx) => {
   await ctx.answerCbQuery();
-  initSession(ctx).step = 'dirty_check';
-  await ctx.reply('🔍 Введіть адресу для перевірки:');
+  try {
+    // Show list of all unique addresses as buttons
+    const records = await sbGet('dirty_addresses', '?select=addr&order=addr');
+    const unique = [...new Set(records.map(r => r.addr))].slice(0, 40);
+
+    if (!unique.length) return ctx.editMessageText('Записів немає');
+
+    const rows = unique.map(addr =>
+      [Markup.button.callback(addr.substring(0, 60), `dcheck_${encodeAddr(addr)}`)]
+    );
+    rows.push([Markup.button.callback('« Назад', 'da_back')]);
+
+    await ctx.editMessageText('Виберіть адресу для перевірки:', Markup.inlineKeyboard(rows));
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
+});
+
+bot.action('da_back', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('Грязні адреси:', Markup.inlineKeyboard([
+    [Markup.button.callback('➕ Додати запис', 'da_add')],
+    [Markup.button.callback('🔍 Перевірити адресу', 'da_check')],
+    [Markup.button.callback('📋 Останні 10 записів', 'da_list')],
+    [Markup.button.callback('« Назад', 'back_main')],
+  ]));
+});
+
+// Encode addr for callback (max 64 bytes total in callback_data)
+function encodeAddr(addr) {
+  return Buffer.from(addr).toString('base64').substring(0, 40);
+}
+
+// Store addr map in memory for lookups
+const addrCache = {};
+
+bot.action('da_check', async (ctx) => {
+  await ctx.answerCbQuery();
+  try {
+    const records = await sbGet('dirty_addresses', '?select=addr&order=addr');
+    const unique = [...new Set(records.map(r => r.addr))].slice(0, 30);
+    if (!unique.length) return ctx.editMessageText('Записів немає');
+
+    const rows = unique.map((addr, i) => {
+      const key = `da${i}`;
+      addrCache[key] = addr;
+      return [Markup.button.callback(addr.substring(0, 55), `dcheck_${key}`)];
+    });
+    rows.push([Markup.button.callback('« Назад', 'da_back')]);
+    await ctx.editMessageText('Виберіть адресу:', Markup.inlineKeyboard(rows));
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
+});
+
+bot.action(/^dcheck_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const key = ctx.match[1];
+  const addr = addrCache[key];
+  if (!addr) return ctx.editMessageText('Адресу не знайдено, спробуйте ще раз');
+
+  try {
+    const records = await sbGet('dirty_addresses', `?addr=eq.${encodeURIComponent(addr)}&order=date.desc`);
+    if (!records.length) {
+      return ctx.editMessageText(`Адреса: ${addr}\n\nЗаписів немає — адреса вільна!`,
+        Markup.inlineKeyboard([[Markup.button.callback('« Назад', 'da_check')]]));
+    }
+
+    const lines = [`Адреса: ${addr}`, `Знайдено записів: ${records.length}`, ''];
+    records.forEach(r => {
+      lines.push(`${r.shop} — ${r.tg || 'без TG'} — ${r.method || ''} — ${r.date || ''}`);
+    });
+
+    await ctx.editMessageText(lines.join('\n'),
+      Markup.inlineKeyboard([[Markup.button.callback('« Назад', 'da_check')]]));
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
 });
 
 bot.action('da_list', async (ctx) => {
   await ctx.answerCbQuery();
   try {
-    const records = await db.get('dirty_addresses', '?order=id.desc&limit=10');
-    if (!records.length) return ctx.reply('📋 Записів немає');
-    const msg = records.map(r =>
-      `📍 *${r.addr}*\n  🏪 ${r.shop} · 👤 ${r.tg || '—'} · 📅 ${r.date || '—'} · ${r.method || '—'}`
-    ).join('\n\n');
-    await ctx.reply(msg, { parse_mode: 'Markdown' });
-  } catch (e) { ctx.reply('❌ ' + e.message); }
+    const records = await sbGet('dirty_addresses', '?order=id.desc&limit=10');
+    if (!records.length) return ctx.editMessageText('Записів немає');
+
+    const lines = ['Останні 10 записів:', ''];
+    records.forEach(r => {
+      lines.push(`${r.addr}`);
+      lines.push(`  ${r.shop} — ${r.tg || 'без TG'} — ${r.method || ''} — ${r.date || ''}`);
+      lines.push('');
+    });
+
+    await ctx.editMessageText(lines.join('\n'),
+      Markup.inlineKeyboard([[Markup.button.callback('« Назад', 'da_back')]]));
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
 });
 
 // ═══════════════════════════════════════
-// CLIENTS
+// ADD PARCEL — dialog
 // ═══════════════════════════════════════
-bot.hears('👥 Клієнти', async (ctx) => {
+bot.hears('📦 Нова посилка', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
+  const s = sess(ctx);
+  s.step = 'parcel_client';
+  s.newParcel = {};
+
   try {
-    const clients = await db.get('clients', '?order=name&select=id,name,phone,tg,status');
-    if (!clients.length) return ctx.reply('👥 Клієнтів немає');
+    const clients = await sbGet('clients', '?status=eq.active&select=id,name,tg&order=name');
+    s.clients = clients;
 
-    const msg = clients.map(c =>
-      `👤 *${c.name}*\n  📞 ${c.phone || '—'} · ${c.tg || '—'}`
-    ).join('\n\n');
+    const rows = clients.slice(0, 20).map(c =>
+      [Markup.button.callback(c.name + (c.tg ? ' ' + c.tg : ''), `nc_${c.id}`)]
+    );
+    rows.push([Markup.button.callback('« Скасувати', 'back_main')]);
+    await ctx.reply('Оберіть клієнта:', Markup.inlineKeyboard(rows));
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
+});
 
-    await ctx.reply(`👥 *Клієнти (${clients.length})*\n\n${msg}`, { parse_mode: 'Markdown' });
-  } catch (e) { ctx.reply('❌ ' + e.message); }
+bot.action(/^nc_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  s.newParcel.client_id = parseInt(ctx.match[1]);
+  s.step = 'parcel_addr';
+
+  try {
+    const addrs = await sbGet('addresses', '?status=eq.free&select=id,name,street,house,city');
+    const rows = addrs.map(a =>
+      [Markup.button.callback(`${a.name} — ${a.street} ${a.house}, ${a.city}`, `na_${a.id}`)]
+    );
+    rows.push([Markup.button.callback('« Назад', 'back_main')]);
+    await ctx.editMessageText('Оберіть адресу ЄС:', Markup.inlineKeyboard(rows));
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
+});
+
+bot.action(/^na_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  sess(ctx).newParcel.addr_id = parseInt(ctx.match[1]);
+  sess(ctx).step = 'parcel_shop';
+
+  const shops = ['Amazon','Aliexpress','About You','Zalando','H&M','Zara','eBay','ASOS','Shein','Otto'];
+  const rows = [];
+  for (let i = 0; i < shops.length; i += 3) {
+    rows.push(shops.slice(i, i+3).map(s => Markup.button.callback(s, `ns_${s}`)));
+  }
+  rows.push([Markup.button.callback('✏ Інший магазин', 'ns_other')]);
+  rows.push([Markup.button.callback('« Назад', 'back_main')]);
+  await ctx.editMessageText('Оберіть магазин:', Markup.inlineKeyboard(rows));
+});
+
+bot.action(/^ns_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const shop = ctx.match[1];
+  if (shop === 'other') {
+    sess(ctx).step = 'parcel_shop_text';
+    return ctx.editMessageText('Введіть назву магазину:');
+  }
+  sess(ctx).newParcel.shop = shop;
+  sess(ctx).step = 'parcel_track';
+  await ctx.editMessageText(`Магазин: ${shop}\n\nВведіть tracking номер (або /skip):`);
 });
 
 // ═══════════════════════════════════════
-// TEXT MESSAGE HANDLER — step-by-step dialogs
+// TEXT HANDLER
 // ═══════════════════════════════════════
 bot.on('text', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
-  const sess = initSession(ctx);
+  const s = sess(ctx);
   const text = ctx.message.text.trim();
+  if (text.startsWith('/') && text !== '/skip') return;
 
-  // Skip /commands
-  if (text.startsWith('/')) return;
-
-  // ── PARCEL DIALOG ──
-  if (sess.step === 'parcel_shop_text') {
-    sess.newParcel.shop = text;
-    sess.step = 'parcel_track';
-    return ctx.reply(`🏪 Магазин: *${text}*\n\n🔍 Введіть tracking номер (або /skip):`, { parse_mode: 'Markdown' });
+  // Quick search by parcel ID
+  if (/^EU-\d+$/i.test(text)) {
+    return showParcel(ctx, text.toUpperCase());
   }
 
-  if (sess.step === 'parcel_track') {
-    sess.newParcel.track = text === '/skip' ? null : text;
-    return askPrice(ctx);
-  }
-
-  if (sess.step === 'parcel_price') {
-    const price = parseFloat(text.replace(',', '.'));
-    if (isNaN(price)) return ctx.reply('⚠️ Введіть число, наприклад: 35');
-    sess.newParcel.price = price;
-    sess.step = 'parcel_ship';
-    return ctx.reply('🚐 Вартість перевезення € (або /skip якщо невідомо):');
-  }
-
-  if (sess.step === 'parcel_ship') {
-    sess.newParcel.ship_cost = text === '/skip' ? 0 : (parseFloat(text.replace(',', '.')) || 0);
-    sess.step = 'parcel_note';
-    return ctx.reply('📝 Примітка (або /skip):');
-  }
-
-  if (sess.step === 'parcel_note') {
-    sess.newParcel.note = text === '/skip' ? null : text;
-    // Save parcel
+  // ── ADD SHIP COST ──
+  if (s.step && s.step.startsWith('addship_')) {
+    const id = s.step.replace('addship_', '');
+    const cost = parseFloat(text.replace(',', '.'));
+    if (isNaN(cost)) return ctx.reply('Введіть число, наприклад: 25');
     try {
-      const newId = 'EU-' + String(Date.now()).slice(-6);
-      const data = {
-        id: newId,
-        ...sess.newParcel,
-        date: td(),
-        status: 'issued',
-        paid1: false,
-        paid2: false,
-      };
-      await db.insert('parcels', data);
-      sess.step = null;
-      sess.newParcel = {};
-
-      await ctx.reply(
-        `✅ Посилку ${newId} створено!\n\n` +
-        `🏪 ${data.shop}\n` +
-        `💰 Послуга: €${data.price} · Перевезення: €${data.ship_cost || 0}\n` +
-        `📊 Статус: 📋 Видана адреса`,
-        { ...mainMenu() }
-      );
-    } catch (e) {
-      ctx.reply('❌ Помилка збереження: ' + e.message);
-    }
-    return;
-  }
-
-  // ── DIRTY ADDRESS DIALOG ──
-  if (sess.step === 'dirty_addr') {
-    sess.newDirty.addr = text;
-    sess.step = 'dirty_shop';
-    const shops = ['Amazon', 'Aliexpress', 'About You', 'Zalando', 'H&M', 'Zara', 'ASOS'];
-    const btns = shops.reduce((rows, s, i) => {
-      if (i % 3 === 0) rows.push([]);
-      rows[rows.length - 1].push(Markup.button.callback(s, `ds_${s}`));
-      return rows;
-    }, []);
-    btns.push([Markup.button.callback('✏️ Інший', 'ds_other')]);
-    return ctx.reply('🏪 Магазин:', Markup.inlineKeyboard(btns));
-  }
-
-  if (sess.step === 'dirty_shop_text') {
-    sess.newDirty.shop = text;
-    sess.step = 'dirty_tg';
-    return ctx.reply('👤 Telegram замовника (або /skip):');
-  }
-
-  if (sess.step === 'dirty_tg') {
-    let tg = text === '/skip' ? '' : text;
-    if (tg && !tg.startsWith('@')) tg = '@' + tg;
-    sess.newDirty.tg = tg;
-    sess.step = 'dirty_method';
-    return ctx.reply('📋 Метод:', Markup.inlineKeyboard([
-      [Markup.button.callback('FTID', 'dm_FTID'), Markup.button.callback('RTS', 'dm_RTS')],
-      [Markup.button.callback('DAMAGE', 'dm_DAMAGE'), Markup.button.callback('DNA', 'dm_DNA')],
-      [Markup.button.callback('Зберігаємо', 'dm_Зберігаємо')],
-    ]));
-  }
-
-  if (sess.step === 'dirty_check') {
-    try {
-      const q = encodeURIComponent(text);
-      const records = await db.get('dirty_addresses', `?addr=ilike.*${text}*&limit=5`);
-      if (!records.length) return ctx.reply(`✅ Адреса *${text}* не знайдена в базі.`, { parse_mode: 'Markdown' });
-      const msg = records.map(r =>
-        `⚠️ *${r.addr}*\n  🏪 ${r.shop} · 👤 ${r.tg || '—'} · 📅 ${r.date || '—'} · ${r.method || '—'}`
-      ).join('\n\n');
-      await ctx.reply(`🔍 Знайдено ${records.length} записів:\n\n${msg}`, { parse_mode: 'Markdown' });
-    } catch (e) { ctx.reply('❌ ' + e.message); }
-    sess.step = null;
+      await sbPatch('parcels', id, { ship_cost: cost }, 'id');
+      s.step = null;
+      await ctx.reply(`Вартість перевезення €${cost} встановлено для ${id}`);
+      await showParcel(ctx, id);
+    } catch (e) { ctx.reply('Помилка: ' + e.message); }
     return;
   }
 
   // ── SEARCH ──
-  if (sess.step === 'search_parcel') {
-    sess.step = null;
-    const q = text.toUpperCase();
+  if (s.step === 'search') {
+    s.step = null;
     try {
       let parcels = [];
-      if (q.startsWith('EU-')) {
-        parcels = await db.get('parcels', `?id=eq.${q}`);
+      if (text.toUpperCase().startsWith('EU-')) {
+        parcels = await sbGet('parcels', `?id=eq.${text.toUpperCase()}`);
       } else {
-        parcels = await db.get('parcels', `?track=eq.${text}`);
+        parcels = await sbGet('parcels', `?track=eq.${text}`);
       }
-      if (!parcels.length) return ctx.reply(`❌ Нічого не знайдено за запитом: ${text}`);
-      const p = parcels[0];
+      if (!parcels.length) return ctx.reply(`Нічого не знайдено: ${text}`);
       const [clients, carriers] = await Promise.all([
-        db.get('clients', '?select=id,name,tg'),
-        db.get('carriers', '?select=id,name')
+        sbGet('clients', '?select=id,name,tg'),
+        sbGet('carriers', '?select=id,name')
       ]);
-      await ctx.reply(fmt(p, clients, carriers), { parse_mode: 'Markdown', ...parcelButtons(p) });
-    } catch (e) { ctx.reply('❌ ' + e.message); }
+      const p = parcels[0];
+      await ctx.reply(fmtParcel(p, clients, carriers), { parse_mode: 'Markdown', ...parcelActions(p) });
+    } catch (e) { ctx.reply('Помилка: ' + e.message); }
     return;
+  }
+
+  // ── PARCEL DIALOG ──
+  if (s.step === 'parcel_shop_text') {
+    s.newParcel.shop = text;
+    s.step = 'parcel_track';
+    return ctx.reply(`Магазин: ${text}\n\nВведіть tracking номер (або /skip):`);
+  }
+  if (s.step === 'parcel_track') {
+    s.newParcel.track = text === '/skip' ? null : text;
+    s.step = 'parcel_price';
+    return ctx.reply('Вартість послуги €? (тільки число):');
+  }
+  if (s.step === 'parcel_price') {
+    const price = parseFloat(text.replace(',', '.'));
+    if (isNaN(price)) return ctx.reply('Введіть число, наприклад: 35');
+    s.newParcel.price = price;
+    s.step = 'parcel_ship';
+    return ctx.reply('Вартість перевезення € (або /skip):');
+  }
+  if (s.step === 'parcel_ship') {
+    s.newParcel.ship_cost = text === '/skip' ? 0 : (parseFloat(text.replace(',', '.')) || 0);
+    s.step = 'parcel_note';
+    return ctx.reply('Примітка (або /skip):');
+  }
+  if (s.step === 'parcel_note') {
+    s.newParcel.note = text === '/skip' ? null : text;
+    try {
+      const newId = 'EU-' + String(Date.now()).slice(-6);
+      const data = { id: newId, ...s.newParcel, date: td(), status: 'issued', paid1: false, paid2: false };
+      await sbPost('parcels', data);
+      s.step = null;
+      s.newParcel = {};
+      await ctx.reply(`Посилку ${newId} створено!\n\nМагазин: ${data.shop}\nПослуга: €${data.price}\nПеревезення: €${data.ship_cost || 0}`, mainMenu());
+    } catch (e) { ctx.reply('Помилка збереження: ' + e.message); }
+    return;
+  }
+
+  // ── DIRTY ADDRESS DIALOG ──
+  if (s.step === 'dirty_addr') {
+    s.newDirty = { addr: text };
+    s.step = 'dirty_shop';
+    const shops = ['Amazon','Aliexpress','About You','Zalando','H&M','Zara','ASOS','Shein'];
+    const rows = [];
+    for (let i = 0; i < shops.length; i += 3) {
+      rows.push(shops.slice(i, i+3).map(sh => Markup.button.callback(sh, `ds_${sh}`)));
+    }
+    rows.push([Markup.button.callback('✏ Інший', 'ds_other')]);
+    return ctx.reply('Магазин:', Markup.inlineKeyboard(rows));
+  }
+  if (s.step === 'dirty_shop_text') {
+    s.newDirty.shop = text;
+    s.step = 'dirty_tg';
+    return ctx.reply('Telegram замовника (або /skip):');
+  }
+  if (s.step === 'dirty_tg') {
+    s.newDirty.tg = text === '/skip' ? '' : (text.startsWith('@') ? text : '@' + text);
+    s.step = 'dirty_method';
+    return ctx.reply('Метод:', Markup.inlineKeyboard([
+      [Markup.button.callback('FTID', 'dm_FTID'), Markup.button.callback('RTS', 'dm_RTS')],
+      [Markup.button.callback('DAMAGE', 'dm_DAMAGE'), Markup.button.callback('DNA', 'dm_DNA')],
+    ]));
   }
 });
 
 // Dirty shop/method callbacks
 bot.action(/^ds_(.+)$/, async (ctx) => {
-  const sess = initSession(ctx);
   await ctx.answerCbQuery();
   const val = ctx.match[1];
+  const s = sess(ctx);
   if (val === 'other') {
-    sess.step = 'dirty_shop_text';
-    return ctx.editMessageText('🏪 Введіть назву магазину:');
+    s.step = 'dirty_shop_text';
+    return ctx.editMessageText('Введіть назву магазину:');
   }
-  sess.newDirty.shop = val;
-  sess.step = 'dirty_tg';
-  await ctx.editMessageText(`🏪 ${val}\n\n👤 Telegram замовника (або /skip):`);
+  s.newDirty.shop = val;
+  s.step = 'dirty_tg';
+  await ctx.editMessageText(`Магазин: ${val}\n\nTelegram замовника (або /skip):`);
 });
 
 bot.action(/^dm_(.+)$/, async (ctx) => {
-  const sess = initSession(ctx);
   await ctx.answerCbQuery();
-  sess.newDirty.method = ctx.match[1];
-  // Save
+  const s = sess(ctx);
+  s.newDirty.method = ctx.match[1];
   try {
-    const data = { ...sess.newDirty, date: new Date().toLocaleDateString('uk-UA') };
-    await db.insert('dirty_addresses', data);
-    sess.step = null;
-    sess.newDirty = {};
-    await ctx.editMessageText(`✅ Запис додано!\n\n📍 ${data.addr}\n🏪 ${data.shop} · ${data.tg || '—'} · ${data.method}`);
-  } catch (e) { ctx.reply('❌ ' + e.message); }
+    const data = { ...s.newDirty, date: new Date().toLocaleDateString('uk-UA') };
+    await sbPost('dirty_addresses', data);
+    s.step = null;
+    s.newDirty = {};
+    await ctx.editMessageText(`Запис додано!\n\nАдреса: ${data.addr}\nМагазин: ${data.shop}\nTG: ${data.tg || 'немає'}\nМетод: ${data.method}`);
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
 });
 
 // ═══════════════════════════════════════
-// MORNING REPORT — scheduled
+// MORNING REPORT
 // ═══════════════════════════════════════
 async function sendMorningReport() {
   if (!ADMIN_IDS.length) return;
   try {
-    const [parcels, clients] = await Promise.all([
-      db.get('parcels', '?order=date.desc'),
-      db.get('clients', '?select=id,name,tg')
-    ]);
-
-    const today = td();
+    const parcels = await sbGet('parcels', '?select=status,price,ship_cost,paid1,paid2,client_id');
     const byStatus = {};
     parcels.forEach(p => { byStatus[p.status] = (byStatus[p.status] || 0) + 1; });
 
@@ -687,42 +834,33 @@ async function sendMorningReport() {
       if (owes > 0) debtMap[p.client_id] = (debtMap[p.client_id] || 0) + owes;
     });
 
-    const top3 = Object.entries(debtMap)
-      .sort((a, b) => b[1] - a[1]).slice(0, 3)
-      .map(([cid, amt]) => {
-        const cl = clients.find(c => c.id === parseInt(cid)) || { name: '?' };
-        return `  • ${cl.name} — €${amt}`;
-      }).join('\n');
-
-    const msg = `☀️ *Доброго ранку\\! Зведення EuroPost*
-📅 ${new Date().toLocaleDateString('uk-UA')}
-
-📦 Всього посилок: ${parcels.length}
-  На складі ЄС: ${byStatus.warehouse || 0}
-  На адресі: ${byStatus.address || 0}
-  В дорозі: ${byStatus.carrier || 0}
-  В UA: ${byStatus.ua || 0}
-
-💰 Очікується оплат: €${pending}
-⚠️ Боржників: ${Object.keys(debtMap).length}
-${top3 ? '\nТоп боржників:\n' + top3 : ''}`;
+    const lines = [
+      'Добрий ранок! Зведення EuroPost',
+      new Date().toLocaleDateString('uk-UA'),
+      '',
+      `Всього посилок: ${parcels.length}`,
+      `На складі ЄС: ${byStatus.warehouse || 0}`,
+      `На адресі: ${byStatus.address || 0}`,
+      `В дорозі: ${byStatus.carrier || 0}`,
+      `В Україні: ${byStatus.ua || 0}`,
+      '',
+      `Очікується оплат: €${pending}`,
+      `Боржників: ${Object.keys(debtMap).length}`,
+    ];
 
     for (const adminId of ADMIN_IDS) {
-      await bot.telegram.sendMessage(adminId, msg, { parse_mode: 'Markdown' });
+      await bot.telegram.sendMessage(adminId, lines.join('\n'));
     }
-  } catch (e) {
-    console.error('Morning report error:', e.message);
-  }
+  } catch (e) { console.error('Morning report error:', e.message); }
 }
 
-// Schedule morning report
 function scheduleMorning() {
   const now = new Date();
   const next = new Date();
   next.setHours(MORNING_HOUR, 0, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
   const ms = next - now;
-  console.log(`⏰ Ранкова зведення через ${Math.round(ms / 60000)} хв`);
+  console.log(`Morning report in ${Math.round(ms / 60000)} min`);
   setTimeout(() => {
     sendMorningReport();
     setInterval(sendMorningReport, 24 * 60 * 60 * 1000);
@@ -733,7 +871,7 @@ function scheduleMorning() {
 // LAUNCH
 // ═══════════════════════════════════════
 bot.launch().then(() => {
-  console.log('🚀 EuroPost Bot запущено!');
+  console.log('EuroPost Bot started!');
   scheduleMorning();
 });
 
