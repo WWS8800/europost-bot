@@ -136,8 +136,8 @@ bot.start(async (ctx) => {
   }
   initSession(ctx).step = null;
   await ctx.reply(
-    `👋 Привіт, *${ctx.from.first_name}*\\!\n\nEuroPost CRM — панель управління\\.`,
-    { parse_mode: 'MarkdownV2', ...mainMenu() }
+    `👋 Привіт, ${ctx.from.first_name}!\n\nEuroPost CRM — панель управління.`,
+    { ...mainMenu() }
   );
 });
 
@@ -556,11 +556,11 @@ bot.on('text', async (ctx) => {
       sess.newParcel = {};
 
       await ctx.reply(
-        `✅ *Посилку ${newId} створено\\!*\n\n` +
+        `✅ Посилку ${newId} створено!\n\n` +
         `🏪 ${data.shop}\n` +
         `💰 Послуга: €${data.price} · Перевезення: €${data.ship_cost || 0}\n` +
         `📊 Статус: 📋 Видана адреса`,
-        { parse_mode: 'MarkdownV2', ...mainMenu() }
+        { ...mainMenu() }
       );
     } catch (e) {
       ctx.reply('❌ Помилка збереження: ' + e.message);
@@ -708,7 +708,7 @@ async function sendMorningReport() {
 ${top3 ? '\nТоп боржників:\n' + top3 : ''}`;
 
     for (const adminId of ADMIN_IDS) {
-      await bot.telegram.sendMessage(adminId, msg, { parse_mode: 'MarkdownV2' });
+      await bot.telegram.sendMessage(adminId, msg, { parse_mode: 'Markdown' });
     }
   } catch (e) {
     console.error('Morning report error:', e.message);
