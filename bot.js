@@ -1133,9 +1133,22 @@ async function finalizeIssueAddr(ctx, note) {
 // ═══════════════════════════════════════
 // LAUNCH
 // ═══════════════════════════════════════
-bot.launch().then(() => {
+// Clear any existing webhook and pending updates before launch
+async function startBot() {
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    console.log('Webhook cleared');
+  } catch(e) {
+    console.log('Webhook clear skipped:', e.message);
+  }
+  await bot.launch({ dropPendingUpdates: true });
   console.log('EuroPost Bot started!');
   scheduleMorning();
+}
+
+startBot().catch(err => {
+  console.error('Bot start error:', err.message);
+  process.exit(1);
 });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
