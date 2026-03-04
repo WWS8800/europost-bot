@@ -196,7 +196,7 @@ bot.action(/^back_parcels_(\d+)$/, async (ctx) => {
 // ═══════════════════════════════════════
 // ADD CLIENT — dialog
 // ═══════════════════════════════════════
-bot.hears('➕ Новий клієнт', async (ctx) => {
+bot.hears(/Новий клієнт/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   const s = sess(ctx);
   s.step = 'client_name';
@@ -215,7 +215,7 @@ bot.action('add_client', async (ctx) => {
 // ═══════════════════════════════════════
 // CLIENTS — paginated list
 // ═══════════════════════════════════════
-bot.hears('👥 Клієнти', async (ctx) => {
+bot.hears(/Клієнти/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   await showClients(ctx, 0);
 });
@@ -429,7 +429,7 @@ bot.action(/^cancel_(.+)$/, async (ctx) => {
 // ═══════════════════════════════════════
 // SEARCH
 // ═══════════════════════════════════════
-bot.hears('🔍 Знайти посилку', async (ctx) => {
+bot.hears(/Знайти посилку/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   sess(ctx).step = 'search';
   await ctx.reply('Введіть ID посилки (EU-XXXXXX) або tracking номер:');
@@ -438,7 +438,7 @@ bot.hears('🔍 Знайти посилку', async (ctx) => {
 // ═══════════════════════════════════════
 // REPORT
 // ═══════════════════════════════════════
-bot.hears('📊 Звіт', async (ctx) => {
+bot.hears(/Звіт/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   try {
     const parcels = await sbGet('parcels', '?select=status,date,price,ship_cost,paid1,paid2,client_id');
@@ -486,7 +486,7 @@ bot.hears('📊 Звіт', async (ctx) => {
 // ═══════════════════════════════════════
 // DEBTORS
 // ═══════════════════════════════════════
-bot.hears('💰 Боржники', async (ctx) => {
+bot.hears(/Боржники/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   try {
     const [parcels, clients] = await Promise.all([
@@ -525,7 +525,7 @@ bot.hears('💰 Боржники', async (ctx) => {
 // ═══════════════════════════════════════
 // DIRTY ADDRESSES
 // ═══════════════════════════════════════
-bot.hears('🗂 Грязні адреси', async (ctx) => {
+bot.hears(/Грязні адреси/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   await ctx.reply('Грязні адреси:', Markup.inlineKeyboard([
     [Markup.button.callback('➕ Додати запис', 'da_add')],
@@ -639,7 +639,7 @@ bot.action('da_list', async (ctx) => {
 // ═══════════════════════════════════════
 // ADD PARCEL — dialog
 // ═══════════════════════════════════════
-bot.hears('📦 Нова посилка', async (ctx) => {
+bot.hears(/Нова посилка/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   const s = sess(ctx);
   s.step = 'parcel_client';
@@ -960,7 +960,7 @@ function scheduleMorning() {
 // ═══════════════════════════════════════
 // ISSUE ADDRESS — full cycle
 // ═══════════════════════════════════════
-bot.hears('📍 Видати адресу', async (ctx) => {
+bot.hears(/Видати адресу/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   const s = sess(ctx);
   s.step = null;
