@@ -148,6 +148,17 @@ function parcelActions(p) {
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(session());
 
+// DEBUG — log all messages
+bot.use(async (ctx, next) => {
+  if (ctx.message?.text) {
+    console.log('MSG:', JSON.stringify(ctx.message.text), 'from:', ctx.from?.id);
+  }
+  if (ctx.callbackQuery?.data) {
+    console.log('CB:', ctx.callbackQuery.data);
+  }
+  return next();
+});
+
 function sess(ctx) {
   if (!ctx.session) ctx.session = {};
   return ctx.session;
