@@ -782,16 +782,30 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // ── ISSUE ADDRESS ──
-  if (s.step === 'ia_shop_text') {
-    sess(ctx).issueAddr.shop = text;
-    s.step = null;
-    await askIssueMethod(ctx);
-    return;
+  // ── ISSUE ADDRESS STEPS ──
+  if (s.step === 'ia_shop') {
+    s.ia.shop = text;
+    s.step = 'ia_date';
+    const today = new Date().toLocaleDateString('uk-UA');
+    return ctx.reply(`Магазин: ${text}\n\nДата (або /skip для сьогодні ${today}):`);
   }
+
+  if (s.step === 'ia_date') {
+    s.ia.date = text === '/skip' ? new Date().toLocaleDateString('uk-UA') : text;
+    s.step = 'ia_method';
+    return ctx.reply(`Дата: ${s.ia.date}\n\nМетод (FTID / RTS / DAMAGE / DNA або інший):`);
+  }
+
+  if (s.step === 'ia_method') {
+    s.ia.method = text;
+    s.step = 'ia_note';
+    return ctx.reply(`Метод: ${text}\n\nПримітка (або /skip):`);
+  }
+
   if (s.step === 'ia_note') {
+    s.ia.note = text === '/skip' ? '' : text;
     s.step = null;
-    await finalizeIssueAddr(ctx, text === '/skip' ? '' : text);
+    await saveIssueAddr(ctx);
     return;
   }
 
@@ -906,6 +920,158 @@ bot.action(/^dm_(.+)$/, async (ctx) => {
   } catch (e) { ctx.reply('Помилка: ' + e.message); }
 });
 
+
+// ═══════════════════════════════════════
+// ISSUE ADDRESS — повний цикл
+// ═══════════════════════════════════════
+bot.hears(/Видати адресу/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const s = sess(ctx);
+
+  try {
+    const clients = await sbGet('clients', '?order=name&select=id,name,tg');
+    if (!clients.length) return ctx.reply('Немає клієнтів в базі');
+
+    const rows = clients.map(c =>
+      [Markup.button.callback(
+        c.name + (c.tg ? ' ' + c.tg : ''),
+        `ia_cl_${c.id}`
+      )]
+    );
+    rows.push([Markup.button.callback('« Скасувати', 'back_main')]);
+    await ctx.reply('📍 Видача адреси\n\nОберіть клієнта:', Markup.inlineKeyboard(rows));
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
+});
+
+// Крок 1 — обрали клієнта → показуємо адреси ЄС
+bot.action(/^ia_cl_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  const cId = parseInt(ctx.match[1]);
+
+  try {
+    const [clients, addrs] = await Promise.all([
+      sbGet('clients', `?id=eq.${cId}&select=id,name,tg`),
+      sbGet('addresses', '?order=name&select=id,name,street,house,zip,city,country,phone,door')
+    ]);
+    const cl = clients[0];
+    if (!addrs.length) return ctx.editMessageText('Немає адрес ЄС в базі');
+
+    s.ia = { client_id: cId, clientName: cl.name, clientTg: cl.tg || '' };
+    s.iaAddrs = addrs;
+
+    const rows = addrs.map(a =>
+      [Markup.button.callback(
+        `${a.name} — ${a.street} ${a.house}, ${a.city}`,
+        `ia_ad_${a.id}`
+      )]
+    );
+    rows.push([Markup.button.callback('« Назад', 'back_main')]);
+    await ctx.editMessageText(
+      `👤 Клієнт: ${cl.name}\n\nОберіть адресу ЄС:`,
+      Markup.inlineKeyboard(rows)
+    );
+  } catch (e) { ctx.reply('Помилка: ' + e.message); }
+});
+
+// Крок 2 — обрали адресу → просимо магазин текстом
+bot.action(/^ia_ad_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  const aId = parseInt(ctx.match[1]);
+  const addr = (s.iaAddrs || []).find(a => a.id === aId);
+  if (!addr) return ctx.reply('Адресу не знайдено, спробуйте ще раз');
+
+  s.ia.addr_id = aId;
+  s.ia.addrObj = addr;
+  s.step = 'ia_shop';
+
+  // Show full address
+  const lines = [
+    addr.name,
+    addr.street + ' ' + addr.house + (addr.door ? ', ' + addr.door : ''),
+    addr.zip + ' ' + addr.city,
+    addr.country || '',
+    addr.phone ? 'Tel: ' + addr.phone : '',
+  ].filter(Boolean).join('\n');
+
+  await ctx.editMessageText(
+    `📍 Адреса:\n${lines}\n\nВведіть магазин (наприклад: Amazon, Zalando...):`
+  );
+});
+
+// Крок 3 — ввели магазин → просимо дату
+// Крок 4 — ввели дату → просимо метод
+// Крок 5 — ввели метод → просимо примітку
+// Крок 6 — ввели примітку → зберігаємо і видаємо результат
+
+
+async function saveIssueAddr(ctx) {
+  const s = sess(ctx);
+  const ia = s.ia;
+  const a = ia.addrObj;
+  const todayISO = new Date().toISOString().split('T')[0];
+
+  // Full address text
+  const addrLines = [
+    a.name,
+    a.street + ' ' + a.house + (a.door ? ', ' + a.door : ''),
+    a.zip + ' ' + a.city,
+    a.country || '',
+    a.phone ? 'Tel: ' + a.phone : '',
+  ].filter(Boolean);
+
+  try {
+    // 1. Save to dirty_addresses
+    await sbPost('dirty_addresses', {
+      addr: a.name + ' ' + a.street + ' ' + a.house,
+      shop: ia.shop,
+      tg: ia.clientTg,
+      date: ia.date,
+      method: ia.method,
+      note: ia.note || '',
+    });
+
+    // 2. Create parcel with status issued
+    const newId = 'EU-' + String(Date.now()).slice(-6);
+    await sbPost('parcels', {
+      id: newId,
+      client_id: ia.client_id,
+      addr_id: ia.addr_id,
+      shop: ia.shop,
+      date: todayISO,
+      status: 'issued',
+      price: 0,
+      ship_cost: 0,
+      paid1: false,
+      paid2: false,
+      note: ia.note || '',
+    });
+
+    // 3. Reply with full address block
+    const msg = [
+      '✅ Адресу видано! Посилка ' + newId + ' створена.',
+      '',
+      '👤 ' + ia.clientName + (ia.clientTg ? ' ' + ia.clientTg : ''),
+      '',
+      '📍 АДРЕСА ДЛЯ ЗАМОВЛЕННЯ:',
+      '──────────────────',
+      ...addrLines,
+      '──────────────────',
+      '',
+      'Магазин: ' + ia.shop,
+      'Метод: ' + ia.method,
+      'Дата: ' + ia.date,
+      ia.note ? 'Примітка: ' + ia.note : '',
+    ].filter(l => l !== null).join('\n');
+
+    s.ia = {};
+    await ctx.reply(msg, mainMenu());
+  } catch (e) {
+    ctx.reply('Помилка збереження: ' + e.message);
+  }
+}
+
 // ═══════════════════════════════════════
 // MORNING REPORT
 // ═══════════════════════════════════════
@@ -957,178 +1123,7 @@ function scheduleMorning() {
 }
 
 
-// ═══════════════════════════════════════
-// ISSUE ADDRESS — full cycle
-// ═══════════════════════════════════════
-bot.hears(/Видати адресу/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  const s = sess(ctx);
-  s.step = null;
-  s.issueAddr = {};
 
-  try {
-    const clients = await sbGet('clients', '?order=name&select=id,name,tg');
-    if (!clients.length) return ctx.reply('Немає клієнтів в базі');
-
-    const rows = clients.slice(0, 20).map(c =>
-      [Markup.button.callback(c.name + (c.tg ? ' ' + c.tg : ''), `ia_cl_${c.id}`)]
-    );
-    rows.push([Markup.button.callback('« Скасувати', 'back_main')]);
-    await ctx.reply('📍 Видача адреси\n\nКрок 1: Оберіть клієнта:', Markup.inlineKeyboard(rows));
-  } catch (e) { ctx.reply('Помилка: ' + e.message); }
-});
-
-bot.action(/^ia_cl_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const s = sess(ctx);
-  s.issueAddr.client_id = parseInt(ctx.match[1]);
-
-  try {
-    const clients = await sbGet('clients', `?id=eq.${s.issueAddr.client_id}&select=id,name,tg`);
-    const cl = clients[0];
-    s.issueAddr.clientName = cl.name;
-    s.issueAddr.clientTg = cl.tg || '';
-
-    // Show EU addresses
-    const addrs = await sbGet('addresses', '?order=name&select=id,name,street,house,zip,city,country,phone,door');
-    if (!addrs.length) return ctx.editMessageText('Немає адрес ЄС в базі');
-    s.issueAddrList = addrs;
-
-    const rows = addrs.map(a =>
-      [Markup.button.callback(`${a.name} — ${a.street} ${a.house}, ${a.city}`, `ia_ad_${a.id}`)]
-    );
-    rows.push([Markup.button.callback('« Назад', 'back_main')]);
-    await ctx.editMessageText(`👤 Клієнт: ${cl.name}\n\nКрок 2: Оберіть адресу ЄС (дроп):`, Markup.inlineKeyboard(rows));
-  } catch (e) { ctx.reply('Помилка: ' + e.message); }
-});
-
-bot.action(/^ia_ad_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const s = sess(ctx);
-  s.issueAddr.addr_id = parseInt(ctx.match[1]);
-
-  // Find address details
-  const addrs = s.issueAddrList || [];
-  const addr = addrs.find(a => a.id === s.issueAddr.addr_id);
-  s.issueAddr.addrObj = addr;
-
-  // Show shop selection
-  const shops = ['Amazon','Aliexpress','About You','Zalando','H&M','Zara','eBay','ASOS','Shein','Otto','Klarstein','Bluetti'];
-  const rows = [];
-  for (let i = 0; i < shops.length; i += 3) {
-    rows.push(shops.slice(i, i+3).map(sh => Markup.button.callback(sh, `ia_sh_${sh}`)));
-  }
-  rows.push([Markup.button.callback('✏ Інший магазин', 'ia_sh_other')]);
-  rows.push([Markup.button.callback('« Назад', 'back_main')]);
-
-  const a = addr;
-  const addrStr = a ? `${a.name}\n${a.street} ${a.house}${a.door ? ', кв/дв ' + a.door : ''}\n${a.zip} ${a.city}\n${a.country || ''}\n📞 ${a.phone || ''}` : '?';
-  await ctx.editMessageText(`Адреса: ${addrStr}\n\nКрок 3: Оберіть магазин:`, Markup.inlineKeyboard(rows));
-});
-
-bot.action(/^ia_sh_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const s = sess(ctx);
-  const shop = ctx.match[1];
-
-  if (shop === 'other') {
-    s.step = 'ia_shop_text';
-    return ctx.editMessageText('Введіть назву магазину:');
-  }
-  s.issueAddr.shop = shop;
-  await askIssueMethod(ctx);
-});
-
-async function askIssueMethod(ctx) {
-  await ctx.reply('Крок 4: Оберіть метод:', Markup.inlineKeyboard([
-    [Markup.button.callback('FTID', 'ia_mt_FTID'), Markup.button.callback('RTS', 'ia_mt_RTS')],
-    [Markup.button.callback('DAMAGE', 'ia_mt_DAMAGE'), Markup.button.callback('DNA', 'ia_mt_DNA')],
-    [Markup.button.callback('Зберігаємо', 'ia_mt_Зберігаємо')],
-  ]));
-}
-
-bot.action(/^ia_mt_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const s = sess(ctx);
-  s.issueAddr.method = ctx.match[1];
-  s.step = 'ia_note';
-  await ctx.reply('Крок 5: Примітка (або /skip):');
-});
-
-// ═══════════════════════════════════════
-// FINALIZE ISSUE ADDRESS
-// ═══════════════════════════════════════
-async function finalizeIssueAddr(ctx, note) {
-  const s = sess(ctx);
-  const ia = s.issueAddr;
-  const a = ia.addrObj;
-  const today = new Date().toLocaleDateString('uk-UA');
-  const todayISO = new Date().toISOString().split('T')[0];
-
-  // 1. Save to dirty_addresses
-  const dirtyData = {
-    addr: `${a.name} ${a.street} ${a.house}`,
-    shop: ia.shop,
-    tg: ia.clientTg,
-    date: today,
-    method: ia.method,
-    note: note || '',
-  };
-
-  // 2. Create parcel with status 'issued'
-  const newId = 'EU-' + String(Date.now()).slice(-6);
-  const parcelData = {
-    id: newId,
-    client_id: ia.client_id,
-    addr_id: ia.addr_id,
-    shop: ia.shop,
-    date: todayISO,
-    status: 'issued',
-    price: 0,
-    ship_cost: 0,
-    paid1: false,
-    paid2: false,
-    note: note || '',
-  };
-
-  try {
-    await Promise.all([
-      sbPost('dirty_addresses', dirtyData),
-      sbPost('parcels', parcelData),
-    ]);
-
-    // Build full address string
-    const addrFull = [
-      `${a.name}`,
-      `${a.street} ${a.house}${a.door ? ', ' + a.door : ''}`,
-      `${a.zip} ${a.city}`,
-      `${a.country || 'Germany'}`,
-      a.phone ? `Tel: ${a.phone}` : '',
-    ].filter(Boolean).join('\n');
-
-    const msg = [
-      `✅ Адресу видано! Посилка ${newId} створена.`,
-      ``,
-      `👤 ${ia.clientName} ${ia.clientTg}`,
-      ``,
-      `📍 АДРЕСА ДЛЯ ЗАМОВЛЕННЯ:`,
-      `━━━━━━━━━━━━━━━━━━`,
-      addrFull,
-      `━━━━━━━━━━━━━━━━━━`,
-      ``,
-      `🏪 Магазин: ${ia.shop}`,
-      `📋 Метод: ${ia.method}`,
-      `📅 Дата: ${today}`,
-      note ? `📝 Примітка: ${note}` : '',
-    ].filter(l => l !== null && l !== undefined).join('\n');
-
-    s.step = null;
-    s.issueAddr = {};
-    await ctx.reply(msg, mainMenu());
-  } catch (e) {
-    ctx.reply('Помилка збереження: ' + e.message);
-  }
-}
 
 // ═══════════════════════════════════════
 // LAUNCH
