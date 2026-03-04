@@ -1135,21 +1135,38 @@ async function finalizeIssueAddr(ctx, note) {
 // ═══════════════════════════════════════
 // Clear any existing webhook and pending updates before launch
 async function startBot() {
-  try {
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-    console.log('Webhook cleared');
-  } catch(e) {
-    console.log('Webhook clear skipped:', e.message);
+  // Wait for any previous instance to fully stop
+  await new Promise(r => setTimeout(r, 3000));
+  
+  // Try to delete webhook and clear updates
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+      console.log('Webhook cleared, attempt', attempt);
+      break;
+    } catch(e) {
+      console.log(`Attempt ${attempt} failed:`, e.message);
+      await new Promise(r => setTimeout(r, 2000 * attempt));
+    }
   }
-  await bot.launch({ dropPendingUpdates: true });
-  console.log('EuroPost Bot started!');
-  scheduleMorning();
+
+  // Try to launch with retries
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await bot.launch({ dropPendingUpdates: true });
+      console.log('EuroPost Bot started!');
+      scheduleMorning();
+      return;
+    } catch(e) {
+      console.log(`Launch attempt ${attempt} failed:`, e.message);
+      if (attempt < 5) await new Promise(r => setTimeout(r, 3000 * attempt));
+    }
+  }
+  console.error('Failed to start bot after 5 attempts');
+  process.exit(1);
 }
 
-startBot().catch(err => {
-  console.error('Bot start error:', err.message);
-  process.exit(1);
-});
+startBot();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
