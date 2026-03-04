@@ -782,18 +782,43 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // ── ISSUE ADDRESS STEPS ──
+  // ── ISSUE ADDRESS TEXT STEPS ──
   if (s.step === 'ia_shop') {
     s.ia.shop = text;
-    s.step = 'ia_date';
-    const today = new Date().toLocaleDateString('uk-UA');
-    return ctx.reply(`Магазин: ${text}\n\nДата (або /skip для сьогодні ${today}):`);
-  }
-
-  if (s.step === 'ia_date') {
-    s.ia.date = text === '/skip' ? new Date().toLocaleDateString('uk-UA') : text;
     s.step = 'ia_method';
-    return ctx.reply(`Дата: ${s.ia.date}\n\nМетод (FTID / RTS / DAMAGE / DNA або інший):`);
+    // Find clean address automatically
+    try {
+      const { allAddrs, clean } = await iaFindCleanAddr(text);
+      if (!clean.length) {
+        s.step = null;
+        return ctx.reply(
+          `Для магазину "${text}" чистих адрес немає!\n` +
+          `Всі ${allAddrs.length} адрес вже використовувались для цього магазину.`
+        );
+      }
+      // Auto-pick first clean address
+      const chosen = clean[0];
+      s.ia.addr_id = chosen.id;
+      s.ia.addrObj = chosen;
+
+      const addrBlock = [
+        chosen.name,
+        chosen.street + ' ' + chosen.house + (chosen.door ? ', ' + chosen.door : ''),
+        (chosen.zip || '') + ' ' + (chosen.city || ''),
+        chosen.country || '',
+        chosen.phone ? 'Tel: ' + chosen.phone : '',
+      ].filter(Boolean).join('\n');
+
+      await ctx.reply(
+        `🏪 Магазин: ${text}\n` +
+        `✅ Знайдено чисту адресу (${clean.length} з ${allAddrs.length} вільні):\n\n` +
+        `📍 ${addrBlock}\n\n` +
+        `Введіть метод (FTID / RTS / DAMAGE / DNA):`
+      );
+    } catch(e) {
+      ctx.reply('Помилка пошуку адреси: ' + e.message);
+    }
+    return;
   }
 
   if (s.step === 'ia_method') {
@@ -805,7 +830,7 @@ bot.on('text', async (ctx) => {
   if (s.step === 'ia_note') {
     s.ia.note = text === '/skip' ? '' : text;
     s.step = null;
-    await saveIssueAddr(ctx);
+    await iaSave(ctx);
     return;
   }
 
@@ -921,118 +946,82 @@ bot.action(/^dm_(.+)$/, async (ctx) => {
 });
 
 
+
 // ═══════════════════════════════════════
-// ISSUE ADDRESS — повний цикл
+// ISSUE ADDRESS — знайти чисту адресу
 // ═══════════════════════════════════════
 bot.hears(/Видати адресу/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
-  const s = sess(ctx);
+  sess(ctx).step = null;
+  sess(ctx).ia = {};
 
   try {
     const clients = await sbGet('clients', '?order=name&select=id,name,tg');
     if (!clients.length) return ctx.reply('Немає клієнтів в базі');
 
     const rows = clients.map(c =>
-      [Markup.button.callback(
-        c.name + (c.tg ? ' ' + c.tg : ''),
-        `ia_cl_${c.id}`
-      )]
+      [Markup.button.callback(c.name + (c.tg ? ' ' + c.tg : ''), `ia_cl_${c.id}`)]
     );
     rows.push([Markup.button.callback('« Скасувати', 'back_main')]);
-    await ctx.reply('📍 Видача адреси\n\nОберіть клієнта:', Markup.inlineKeyboard(rows));
+    await ctx.reply('📍 Видача адреси\n\nКрок 1 — Оберіть клієнта:', Markup.inlineKeyboard(rows));
   } catch (e) { ctx.reply('Помилка: ' + e.message); }
 });
 
-// Крок 1 — обрали клієнта → показуємо адреси ЄС
+// Крок 1 — клієнт обраний → вводимо магазин текстом
 bot.action(/^ia_cl_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const s = sess(ctx);
   const cId = parseInt(ctx.match[1]);
-
   try {
-    const [clients, addrs] = await Promise.all([
-      sbGet('clients', `?id=eq.${cId}&select=id,name,tg`),
-      sbGet('addresses', '?order=name&select=id,name,street,house,zip,city,country,phone,door')
-    ]);
+    const clients = await sbGet('clients', `?id=eq.${cId}&select=id,name,tg`);
     const cl = clients[0];
-    if (!addrs.length) return ctx.editMessageText('Немає адрес ЄС в базі');
-
     s.ia = { client_id: cId, clientName: cl.name, clientTg: cl.tg || '' };
-    s.iaAddrs = addrs;
-
-    const rows = addrs.map(a =>
-      [Markup.button.callback(
-        `${a.name} — ${a.street} ${a.house}, ${a.city}`,
-        `ia_ad_${a.id}`
-      )]
-    );
-    rows.push([Markup.button.callback('« Назад', 'back_main')]);
+    s.step = 'ia_shop';
     await ctx.editMessageText(
-      `👤 Клієнт: ${cl.name}\n\nОберіть адресу ЄС:`,
-      Markup.inlineKeyboard(rows)
+      `👤 Клієнт: ${cl.name}\n\nКрок 2 — Введіть назву магазину:`
     );
   } catch (e) { ctx.reply('Помилка: ' + e.message); }
 });
 
-// Крок 2 — обрали адресу → просимо магазин текстом
-bot.action(/^ia_ad_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const s = sess(ctx);
-  const aId = parseInt(ctx.match[1]);
-  const addr = (s.iaAddrs || []).find(a => a.id === aId);
-  if (!addr) return ctx.reply('Адресу не знайдено, спробуйте ще раз');
+// Текстові кроки флоу
+// ia_shop → ia_method → ia_note → збереження
 
-  s.ia.addr_id = aId;
-  s.ia.addrObj = addr;
-  s.step = 'ia_shop';
+async function iaFindCleanAddr(shop) {
+  // Get all EU addresses
+  const allAddrs = await sbGet('addresses', '?order=name&select=id,name,street,house,zip,city,country,phone,door');
+  // Get all dirty records for this shop
+  const dirty = await sbGet('dirty_addresses', `?shop=eq.${encodeURIComponent(shop)}&select=addr`);
+  const usedAddrs = new Set(dirty.map(d => d.addr.trim().toLowerCase()));
 
-  // Show full address
-  const lines = [
-    addr.name,
-    addr.street + ' ' + addr.house + (addr.door ? ', ' + addr.door : ''),
-    addr.zip + ' ' + addr.city,
-    addr.country || '',
-    addr.phone ? 'Tel: ' + addr.phone : '',
-  ].filter(Boolean).join('\n');
+  // Find clean addresses — not in dirty for this shop
+  const clean = allAddrs.filter(a => {
+    const key = (a.name + ' ' + a.street + ' ' + a.house).trim().toLowerCase();
+    return !usedAddrs.has(key);
+  });
 
-  await ctx.editMessageText(
-    `📍 Адреса:\n${lines}\n\nВведіть магазин (наприклад: Amazon, Zalando...):`
-  );
-});
+  return { allAddrs, clean };
+}
 
-// Крок 3 — ввели магазин → просимо дату
-// Крок 4 — ввели дату → просимо метод
-// Крок 5 — ввели метод → просимо примітку
-// Крок 6 — ввели примітку → зберігаємо і видаємо результат
-
-
-async function saveIssueAddr(ctx) {
+async function iaSave(ctx) {
   const s = sess(ctx);
   const ia = s.ia;
   const a = ia.addrObj;
+  const today = new Date().toLocaleDateString('uk-UA');
   const todayISO = new Date().toISOString().split('T')[0];
-
-  // Full address text
-  const addrLines = [
-    a.name,
-    a.street + ' ' + a.house + (a.door ? ', ' + a.door : ''),
-    a.zip + ' ' + a.city,
-    a.country || '',
-    a.phone ? 'Tel: ' + a.phone : '',
-  ].filter(Boolean);
+  const addrKey = a.name + ' ' + a.street + ' ' + a.house;
 
   try {
-    // 1. Save to dirty_addresses
+    // 1. Грязні адреси
     await sbPost('dirty_addresses', {
-      addr: a.name + ' ' + a.street + ' ' + a.house,
+      addr: addrKey,
       shop: ia.shop,
       tg: ia.clientTg,
-      date: ia.date,
+      date: today,
       method: ia.method,
       note: ia.note || '',
     });
 
-    // 2. Create parcel with status issued
+    // 2. Посилка
     const newId = 'EU-' + String(Date.now()).slice(-6);
     await sbPost('parcels', {
       id: newId,
@@ -1048,24 +1037,32 @@ async function saveIssueAddr(ctx) {
       note: ia.note || '',
     });
 
-    // 3. Reply with full address block
+    // 3. Відповідь з повною адресою
+    const addrBlock = [
+      a.name,
+      a.street + ' ' + a.house + (a.door ? ', ' + a.door : ''),
+      (a.zip || '') + ' ' + (a.city || ''),
+      a.country || '',
+      a.phone ? 'Tel: ' + a.phone : '',
+    ].filter(Boolean).join('\n');
+
     const msg = [
-      '✅ Адресу видано! Посилка ' + newId + ' створена.',
+      '✅ Посилка ' + newId + ' створена',
       '',
       '👤 ' + ia.clientName + (ia.clientTg ? ' ' + ia.clientTg : ''),
+      '🏪 ' + ia.shop,
+      '📋 ' + ia.method,
+      '📅 ' + today,
+      ia.note ? '📝 ' + ia.note : '',
       '',
       '📍 АДРЕСА ДЛЯ ЗАМОВЛЕННЯ:',
-      '──────────────────',
-      ...addrLines,
-      '──────────────────',
-      '',
-      'Магазин: ' + ia.shop,
-      'Метод: ' + ia.method,
-      'Дата: ' + ia.date,
-      ia.note ? 'Примітка: ' + ia.note : '',
+      '─────────────────────',
+      addrBlock,
+      '─────────────────────',
     ].filter(l => l !== null).join('\n');
 
     s.ia = {};
+    s.step = null;
     await ctx.reply(msg, mainMenu());
   } catch (e) {
     ctx.reply('Помилка збереження: ' + e.message);
