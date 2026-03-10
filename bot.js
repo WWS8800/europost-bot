@@ -1045,12 +1045,19 @@ bot.action('ia_sh_new', async (ctx) => {
 async function iaShowAddresses(ctx) {
   const s = sess(ctx);
   try {
-    const [allAddrs, dirty] = await Promise.all([
-      sbGet('addresses', '?order=name&select=id,name,street,house,zip,city,country,phone,door'),
-      sbGet('dirty_addresses', `?shop=eq.${encodeURIComponent(s.ia.shop)}&select=addr`),
+    const [allAddrs, allDirty] = await Promise.all([
+      sbGet('addresses', '?order=name&select=id,name,street,house,zip,city,country,phone,door,status'),
+      sbGet('dirty_addresses', '?select=addr,shop'),
     ]);
 
-    const usedSet = new Set(dirty.map(d => (d.addr || '').trim().toLowerCase()));
+    // Compare shop case-insensitive on client side to avoid URL encoding issues
+    const shopLower = (s.ia.shop || '').trim().toLowerCase();
+    const usedSet = new Set(
+      allDirty
+        .filter(d => (d.shop || '').trim().toLowerCase() === shopLower)
+        .map(d => (d.addr || '').trim().toLowerCase())
+    );
+
     const free = allAddrs.filter(a => {
       const key = (a.name + ' ' + a.street + ' ' + a.house).trim().toLowerCase();
       return a.status === 'free' && !usedSet.has(key);
