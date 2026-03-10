@@ -715,6 +715,51 @@ bot.on('text', async (ctx) => {
     return showParcel(ctx, text.toUpperCase());
   }
 
+  // ── KEYBOARD BUTTONS ──
+  if (/Видати адресу/i.test(text)) return startIssueAddr(ctx);
+  if (/Нова посилка/i.test(text)) {
+    s.step = null;
+    // redirect to hears handler logic inline
+    try {
+      const clients = await sbGet('clients', '?order=name&select=id,name');
+      if (!clients.length) return ctx.reply('Немає клієнтів');
+      const rows = clients.map(c => [Markup.button.callback(c.name, `nc_${c.id}`)]);
+      rows.push([Markup.button.callback('« Назад', 'back_main')]);
+      return ctx.reply('Оберіть клієнта:', Markup.inlineKeyboard(rows));
+    } catch(e) { return ctx.reply('Помилка: ' + e.message); }
+  }
+  if (/Клієнти/i.test(text) && !/Новий клієнт/i.test(text)) {
+    // redirect to clients handler
+    try {
+      const clients = await sbGet('clients', '?order=name&select=id,name,tg,balance,status');
+      if (!clients.length) return ctx.reply('Клієнтів немає');
+      const active = clients.filter(c => c.status !== 'inactive');
+      const rows = active.map(c => {
+        const debt = (c.balance || 0) < 0 ? ' 🔴' : '';
+        return [Markup.button.callback(c.name + debt, `cl_${c.id}`)];
+      });
+      rows.push([Markup.button.callback('« Назад', 'back_main')]);
+      return ctx.reply(`Клієнти (${active.length}):`, Markup.inlineKeyboard(rows));
+    } catch(e) { return ctx.reply('Помилка: ' + e.message); }
+  }
+  if (/Новий клієнт/i.test(text)) {
+    s.step = 'client_name';
+    s.newClient = {};
+    return ctx.reply("Новий клієнт\n\nВведіть ім'я:");
+  }
+  if (/Знайти посилку/i.test(text)) {
+    s.step = 'search';
+    return ctx.reply('Введіть номер посилки (EU-XXXXXX) або tracking:');
+  }
+  if (/Грязні адреси/i.test(text)) {
+    return ctx.reply('🗂 Грязні адреси:', Markup.inlineKeyboard([
+      [Markup.button.callback('➕ Додати запис', 'da_add')],
+      [Markup.button.callback('🔍 Перевірити адресу', 'da_check')],
+      [Markup.button.callback('📋 Останні 10', 'da_list')],
+      [Markup.button.callback('« Назад', 'back_main')],
+    ]));
+  }
+
   // ── ADD SHIP COST ──
   if (s.step && s.step.startsWith('addship_')) {
     const id = s.step.replace('addship_', '');
