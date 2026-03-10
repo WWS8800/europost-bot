@@ -1026,7 +1026,7 @@ async function iaLoadClients(ctx, prefix) {
   await ctx.editMessageText('📍 Крок 1 — Оберіть клієнта:', Markup.inlineKeyboard(rows));
 }
 
-// Mode 2 — client selected → show free addresses
+// Mode 2 — client selected → enter shops first
 bot.action(/^ia2_cl_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const s = sess(ctx);
@@ -1035,34 +1035,13 @@ bot.action(/^ia2_cl_(\d+)$/, async (ctx) => {
   const cl = clients[0];
   s.ia.client_id = cId; s.ia.clientName = cl.name; s.ia.clientTg = cl.tg||'';
   s.ia.shops = [];
-
-  const addrs = await sbGet('addresses', '?status=eq.free&order=name&select=id,name,street,house,city,zip,country,phone,door');
-  s.ia.freeAddrs = addrs;
-
-  if (!addrs.length) return ctx.editMessageText('Немає вільних адрес!', Markup.inlineKeyboard([[Markup.button.callback('« Назад','back_main')]]));
-
-  const rows = addrs.map(a => [Markup.button.callback(a.name+' — '+a.street+' '+a.house+', '+a.city, `ia2_ad_${a.id}`)]);
-  rows.push([Markup.button.callback('« Назад','back_main')]);
-  await ctx.editMessageText(`👤 ${cl.name}\n\nКрок 2 — Оберіть адресу:`, Markup.inlineKeyboard(rows));
-});
-
-// Mode 2 — address selected → enter shops
-bot.action(/^ia2_ad_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const s = sess(ctx);
-  const aId = parseInt(ctx.match[1]);
-  s.ia.addrId = aId;
-  s.ia.addrObj = (s.ia.freeAddrs||[]).find(a=>a.id===aId);
-  s.ia.shops = [];
   s.step = 'ia2_shops';
-  const a = s.ia.addrObj;
   await ctx.editMessageText(
-    `👤 ${s.ia.clientName}\n📍 ${a.name} — ${a.street} ${a.house}, ${a.city}\n\nКрок 3 — Введіть магазини по одному.\nКожне повідомлення = 1 магазин.\nКоли додасте всі — натисніть Готово:`
+    `👤 ${cl.name}\n\nКрок 2 — Введіть магазини по одному.\nКожне повідомлення = 1 магазин.\nСистема знайде адресу чисту для ВСІХ.\n\nСписок: (поки порожній)`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('« Скасувати', 'back_main')],
+    ])
   );
-  await ctx.reply('Список магазинів: (поки порожній)', Markup.inlineKeyboard([
-    [Markup.button.callback('✔ Готово →', 'ia2_shops_done')],
-    [Markup.button.callback('« Скасувати', 'back_main')],
-  ]));
 });
 
 // Step 1 — client selected → show shops
@@ -1235,15 +1214,62 @@ bot.action('ia2_shop_remove', async (ctx) => {
   ]));
 });
 
-// Mode 2 — shops done → select method
+// Mode 2 — shops done → find matching addresses
 bot.action('ia2_shops_done', async (ctx) => {
   await ctx.answerCbQuery();
   const s = sess(ctx);
   if (!s.ia.shops || !s.ia.shops.length) return ctx.answerCbQuery('Додайте хоча б один магазин!');
   s.step = null;
+
+  try {
+    const [allAddrs, allDirty] = await Promise.all([
+      sbGet('addresses', '?status=eq.free&order=name&select=id,name,street,house,zip,city,country,phone,door'),
+      sbGet('dirty_addresses', '?select=addr,shop'),
+    ]);
+
+    // Find addresses clean for ALL shops simultaneously
+    const matching = allAddrs.filter(a => {
+      const addrKey = (a.name + ' ' + a.street + ' ' + a.house).trim().toLowerCase();
+      return s.ia.shops.every(shop => {
+        const shopLow = shop.trim().toLowerCase();
+        return !allDirty.some(d =>
+          (d.addr||'').trim().toLowerCase() === addrKey &&
+          (d.shop||'').trim().toLowerCase() === shopLow
+        );
+      });
+    });
+
+    if (!matching.length) {
+      return ctx.editMessageText(
+        `⚠️ Немає адреси чистої для всіх ${s.ia.shops.length} магазинів одночасно!\n\nСпробуй зменшити список.`,
+        Markup.inlineKeyboard([[Markup.button.callback('« Назад','back_main')]])
+      );
+    }
+
+    s.ia.matchingAddrs = matching;
+    const rows = matching.map(a => [Markup.button.callback(
+      a.name + ' — ' + a.street + ' ' + a.house + ', ' + a.city, `ia2_ad_${a.id}`
+    )]);
+    rows.push([Markup.button.callback('« Назад','back_main')]);
+
+    await ctx.editMessageText(
+      `✅ Підходить для всіх ${s.ia.shops.length} магазинів: ${matching.length} адрес\n\nКрок 3 — Оберіть адресу:`,
+      Markup.inlineKeyboard(rows)
+    );
+  } catch(e) { ctx.reply('Помилка: ' + e.message); }
+});
+
+// Mode 2 — address selected from smart search → method
+bot.action(/^ia2_ad_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  const aId = parseInt(ctx.match[1]);
+  s.ia.addrId = aId;
+  s.ia.addrObj = (s.ia.matchingAddrs||[]).find(a=>a.id===aId);
+  if (!s.ia.addrObj) return ctx.reply('Адресу не знайдено');
   const a = s.ia.addrObj;
   await ctx.editMessageText(
-    `👤 ${s.ia.clientName}\n📍 ${a.name} — ${a.street} ${a.house}\n🏪 Магазинів: ${s.ia.shops.length}\n\nКрок 4 — Оберіть метод:`,
+    `👤 ${s.ia.clientName}\n📍 ${a.name} — ${a.street} ${a.house}, ${a.city}\n🏪 Магазинів: ${s.ia.shops.length}\n\nКрок 4 — Оберіть метод:`,
     Markup.inlineKeyboard([
       [Markup.button.callback('FTID','ia2_mt_FTID'), Markup.button.callback('RTS','ia2_mt_RTS')],
       [Markup.button.callback('DAMAGE','ia2_mt_DAMAGE'), Markup.button.callback('DNA','ia2_mt_DNA')],
