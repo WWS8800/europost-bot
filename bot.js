@@ -1053,7 +1053,7 @@ async function iaShowAddresses(ctx) {
     const usedSet = new Set(dirty.map(d => (d.addr || '').trim().toLowerCase()));
     const free = allAddrs.filter(a => {
       const key = (a.name + ' ' + a.street + ' ' + a.house).trim().toLowerCase();
-      return !usedSet.has(key);
+      return a.status === 'free' && !usedSet.has(key);
     });
 
     s.ia.addrList = allAddrs;
