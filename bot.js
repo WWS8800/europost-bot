@@ -74,16 +74,16 @@ function safe(text) {
 }
 
 const STATUS = {
-  issued:    { l: 'Видана адреса',        e: '📋' },
-  ordered:   { l: 'Замовлено',            e: '📦' },
-  warehouse: { l: 'На складі ЄС',         e: '🏭' },
-  address:   { l: 'На адресі',            e: '🏠' },
-  carrier:   { l: 'У перевізника',        e: '🚐' },
-  np_sent:   { l: 'Відправлено НП',       e: '📮' },
-  ua:        { l: 'В Україні',            e: '🇺🇦' },
-  delivered: { l: 'Доставлено',           e: '✅' },
-  cancelled: { l: 'Скасовано',            e: '❌' },
-  legit:     { l: 'Легіт',               e: '👑' },
+  issued:    { l: 'Видана адреса',          e: '📋' },
+  ordered:   { l: 'Замовлено (є трек)',     e: '📦' },
+  warehouse: { l: 'На відділенні',          e: '🏪' },
+  address:   { l: 'Отримано на адресі',     e: '🏠' },
+  carrier:   { l: 'Передано перевізнику',   e: '🚐' },
+  np_sent:   { l: 'Відправлено НП',         e: '📮' },
+  ua:        { l: 'В UA',                   e: '🇺🇦' },
+  delivered: { l: 'Доставлено',             e: '✅' },
+  cancelled: { l: 'Скасовано',              e: '❌' },
+  legit:     { l: 'Легіт',                  e: '👑' },
 };
 
 const STATUS_FLOW = ['issued','ordered','warehouse','address','carrier','np_sent','ua','delivered'];
@@ -441,17 +441,17 @@ bot.hears(/Знайти посилку/, async (ctx) => {
 
 async function showSearchMenu(ctx) {
   await ctx.reply('🔍 Знайти посилку:', Markup.inlineKeyboard([
-    [Markup.button.callback('📋 Видана адреса',   'srch_issued')],
-    [Markup.button.callback('📦 Замовлено',        'srch_ordered')],
-    [Markup.button.callback('🏭 На складі ЄС',    'srch_warehouse')],
-    [Markup.button.callback('🏠 На адресі',        'srch_address')],
-    [Markup.button.callback('🚐 У перевізника',   'srch_carrier')],
-    [Markup.button.callback('📮 Відправлено НП',  'srch_np_sent')],
-    [Markup.button.callback('🇺🇦 В Україні',       'srch_ua')],
-    [Markup.button.callback('✅ Доставлено',       'srch_delivered')],
-    [Markup.button.callback('👑 Легіт',            'srch_legit')],
-    [Markup.button.callback('❌ Скасовано',        'srch_cancelled')],
-    [Markup.button.callback('🔎 По ID / tracking','srch_manual')],
+    [Markup.button.callback('📋 Видана адреса',        'srch_issued')],
+    [Markup.button.callback('📦 Замовлено (є трек)',   'srch_ordered')],
+    [Markup.button.callback('🏪 На відділенні',        'srch_warehouse')],
+    [Markup.button.callback('🏠 Отримано на адресі',   'srch_address')],
+    [Markup.button.callback('🚐 Передано перевізнику', 'srch_carrier')],
+    [Markup.button.callback('📮 Відправлено НП',       'srch_np_sent')],
+    [Markup.button.callback('🇺🇦 В UA',                 'srch_ua')],
+    [Markup.button.callback('✅ Доставлено',            'srch_delivered')],
+    [Markup.button.callback('👑 Легіт',                'srch_legit')],
+    [Markup.button.callback('❌ Скасовано',             'srch_cancelled')],
+    [Markup.button.callback('🔎 По ID / tracking',     'srch_manual')],
   ]));
 }
 
@@ -1527,30 +1527,36 @@ async function iaFinalize2(ctx, note) {
 async function sendMorningReport() {
   if (!ADMIN_IDS.length) return;
   try {
-    const parcels = await sbGet('parcels', '?select=status,price,ship_cost,paid1,paid2,client_id');
-    const byStatus = {};
-    parcels.forEach(p => { byStatus[p.status] = (byStatus[p.status] || 0) + 1; });
+    const [toPickup, addresses] = await Promise.all([
+      sbGet('parcels', '?status=eq.warehouse&select=id,client_id,shop,track,note,addr_id,description'),
+      sbGet('addresses', '?select=id,name'),
+    ]);
 
-    const pending = parcels.filter(p => !p.paid1 && p.status !== 'cancelled').reduce((s, p) => s + (p.price || 0), 0);
-    const debtMap = {};
-    parcels.filter(p => p.status !== 'cancelled').forEach(p => {
-      const owes = (p.paid1 ? 0 : (p.price || 0)) + (p.paid2 ? 0 : (p.ship_cost || 0));
-      if (owes > 0) debtMap[p.client_id] = (debtMap[p.client_id] || 0) + owes;
-    });
+    const today = new Date().toLocaleDateString('uk-UA');
+
+    if (!toPickup.length) {
+      for (const adminId of ADMIN_IDS) {
+        await bot.telegram.sendMessage(adminId,
+          `☀️ Доброго ранку! ${today}\n\n✅ Посилок на відділенні немає!`
+        );
+      }
+      return;
+    }
 
     const lines = [
-      'Добрий ранок! Зведення EuroPost',
-      new Date().toLocaleDateString('uk-UA'),
+      `☀️ Доброго ранку! ${today}`,
+      `🏪 Потрібно забрати з відділення (${toPickup.length}):`,
       '',
-      `Всього посилок: ${parcels.length}`,
-      `На складі ЄС: ${byStatus.warehouse || 0}`,
-      `На адресі: ${byStatus.address || 0}`,
-      `В дорозі: ${byStatus.carrier || 0}`,
-      `В Україні: ${byStatus.ua || 0}`,
-      '',
-      `Очікується оплат: €${pending}`,
-      `Боржників: ${Object.keys(debtMap).length}`,
     ];
+
+    toPickup.forEach((p, i) => {
+      const addr = addresses.find(a => a.id === p.addr_id);
+      lines.push(`${i + 1}. Адреса: ${addr ? addr.name : '—'}`);
+      lines.push(`   Трек: ${p.track || '—'}`);
+      lines.push(`   Товар: ${p.description || p.note || '—'}`);
+      lines.push(`   Магазин: ${p.shop || '—'}`);
+      lines.push('');
+    });
 
     for (const adminId of ADMIN_IDS) {
       await bot.telegram.sendMessage(adminId, lines.join('\n'));
@@ -1559,15 +1565,30 @@ async function sendMorningReport() {
 }
 
 function scheduleMorning() {
-  const now = new Date();
-  const next = new Date();
-  next.setHours(MORNING_HOUR, 0, 0, 0);
-  if (next <= now) next.setDate(next.getDate() + 1);
-  const ms = next - now;
-  console.log(`Morning report in ${Math.round(ms / 60000)} min`);
+  function msUntilNext() {
+    const now = new Date();
+    // Kyiv: UTC+2 winter, UTC+3 summer
+    const kyivOffsetMs = (now.getTimezoneOffset() < 0 ? 0 : 1) ? 2 * 3600000 : 3 * 3600000;
+    // Simpler: just use fixed UTC+2 (safe for server in UTC)
+    // 10:00 Kyiv = 08:00 UTC (winter) or 07:00 UTC (summer)
+    // Check DST: last Sunday March → October
+    const m = now.getUTCMonth() + 1;
+    const d = now.getUTCDate();
+    const kyivUTCOffset = (m > 3 && m < 10) || (m === 3 && d >= 26) || (m === 10 && d < 29) ? 3 : 2;
+    const targetUTC = MORNING_HOUR - kyivUTCOffset; // e.g. 10-3=7 or 10-2=8
+    const next = new Date();
+    next.setUTCHours(targetUTC, 0, 0, 0);
+    if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+    return next - now;
+  }
+  const ms = msUntilNext();
+  console.log(`Morning report in ${Math.round(ms / 60000)} min (Kyiv 10:00)`);
   setTimeout(() => {
     sendMorningReport();
-    setInterval(sendMorningReport, 24 * 60 * 60 * 1000);
+    // Re-schedule daily (recalculate each time for DST accuracy)
+    setInterval(() => {
+      sendMorningReport();
+    }, 24 * 60 * 60 * 1000);
   }, ms);
 }
 
