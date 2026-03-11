@@ -94,21 +94,26 @@ function getNextStatus(current) {
   return null;
 }
 
-function fmtParcel(p, clients = [], carriers = []) {
+function fmtParcel(p, clients = [], carriers = [], addresses = []) {
   const cl = clients.find(c => c.id === p.client_id) || { name: '?' };
   const cr = carriers.find(c => c.id === p.carrier_id) || { name: '' };
+  const addr = addresses.find(a => a.id === p.addr_id);
   const st = STATUS[p.status] || { l: p.status, e: '📦' };
+  const addrShort = addr
+    ? `${addr.name}, ${addr.street} ${addr.house}`
+    : null;
   const lines = [
     `*${p.id}*`,
     `${st.e} ${st.l}`,
     `👤 ${safe(cl.name)}`,
     `🏪 ${safe(p.shop)}${p.description ? ' — ' + safe(p.description) : ''}`,
+    addrShort ? `📍 ${safe(addrShort)}` : null,
     p.track ? `🔍 \`${p.track}\`` : null,
     `📅 ${p.date}${p.recv_date ? ' | Отримано: ' + p.recv_date : ''}`,
     `💰 Послуга: €${p.price} ${p.paid1 ? '✅' : '❌'}`,
     `🚐 Перевезення: €${p.ship_cost || 0} ${p.paid2 ? '✅' : '❌'}`,
     cr.name ? `🏢 ${safe(cr.name)}` : null,
-    p.recv_data ? `📍 ${safe(p.recv_data)}` : null,
+    p.recv_data ? `📦 ${safe(p.recv_data)}` : null,
     p.deliv_date ? `🎯 Доставлено: ${p.deliv_date}` : null,
     p.note ? `📝 ${safe(p.note)}` : null,
   ];
@@ -333,7 +338,7 @@ async function showParcel(ctx, id) {
     const p = parcels[0];
     if (!p) return ctx.reply(`Посилку ${id} не знайдено`);
 
-    const text = fmtParcel(p, clients, carriers);
+    const text = fmtParcel(p, clients, carriers, addresses);
     if (ctx.callbackQuery) {
       await ctx.editMessageText(text, { parse_mode: 'Markdown', ...parcelActions(p) });
     } else {
@@ -432,8 +437,59 @@ bot.action(/^cancel_(.+)$/, async (ctx) => {
 // ═══════════════════════════════════════
 bot.hears(/Знайти посилку/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
-  sess(ctx).step = 'search';
-  await ctx.reply('Введіть ID посилки (EU-XXXXXX) або tracking номер:');
+  await showSearchMenu(ctx);
+});
+
+async function showSearchMenu(ctx) {
+  await ctx.reply('🔍 Знайти посилку:', Markup.inlineKeyboard([
+    [Markup.button.callback('🆕 Нові (issued)', 'srch_issued')],
+    [Markup.button.callback('📦 В дорозі (in_transit)', 'srch_in_transit')],
+    [Markup.button.callback('🏭 На складі ЄС (received)', 'srch_received')],
+    [Markup.button.callback('🏠 Отримано клієнтом (delivered)', 'srch_delivered')],
+    [Markup.button.callback('✅ Легіт (legit)', 'srch_legit')],
+    [Markup.button.callback('🚫 Скасовані (cancelled)', 'srch_cancelled')],
+    [Markup.button.callback('🔎 Пошук по ID / tracking', 'srch_manual')],
+  ]));
+}
+
+// Status-based search
+bot.action(/^srch_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  const key = ctx.match[1];
+
+  if (key === 'manual') {
+    s.step = 'search';
+    return ctx.editMessageText('Введіть ID посилки (EU-XXXXXX) або tracking номер:');
+  }
+
+  try {
+    const [parcels, clients, addresses] = await Promise.all([
+      sbGet('parcels', `?status=eq.${key}&order=date.desc&limit=30&select=id,client_id,shop,date,status,track,price,ship_cost,paid1,paid2,addr_id,note`),
+      sbGet('clients', '?select=id,name,tg'),
+      sbGet('addresses', '?select=id,name,street,house'),
+    ]);
+
+    if (!parcels.length) {
+      return ctx.editMessageText(`Посилок зі статусом "${key}" немає.`, Markup.inlineKeyboard([[Markup.button.callback('« Назад', 'back_main')]]));
+    }
+
+    const st = STATUS[key] || { l: key, e: '📦' };
+    // Show list of parcels — each as a button
+    const rows = parcels.map(p => {
+      const cl = clients.find(c => c.id === p.client_id);
+      const addr = addresses.find(a => a.id === p.addr_id);
+      const addrShort = addr ? ` · ${addr.name}` : '';
+      const label = `${p.id} · ${cl ? cl.name : '?'} · ${p.shop || '-'}${addrShort}`;
+      return [Markup.button.callback(label.slice(0, 60), `view_${p.id}`)];
+    });
+    rows.push([Markup.button.callback('« Назад', 'back_main')]);
+
+    await ctx.editMessageText(
+      `${st.e} ${st.l} — ${parcels.length} посилок:`,
+      Markup.inlineKeyboard(rows)
+    );
+  } catch(e) { ctx.reply('Помилка: ' + e.message); }
 });
 
 // ═══════════════════════════════════════
@@ -748,8 +804,7 @@ bot.on('text', async (ctx) => {
     return ctx.reply("Новий клієнт\n\nВведіть ім'я:");
   }
   if (/Знайти посилку/i.test(text)) {
-    s.step = 'search';
-    return ctx.reply('Введіть номер посилки (EU-XXXXXX) або tracking:');
+    return showSearchMenu(ctx);
   }
   if (/Грязні адреси/i.test(text)) {
     return ctx.reply('🗂 Грязні адреси:', Markup.inlineKeyboard([
@@ -835,6 +890,13 @@ bot.on('text', async (ctx) => {
     await iaShowAddresses(ctx);
     return;
   }
+  if (s.step === 'ia_shop_search') {
+    s.step = null;
+    s.ia.shopFilter = text;
+    s.ia.shopPage = 0;
+    await iaShowShopMenu(ctx, text);
+    return;
+  }
   if (s.step === 'ia2_shops') {
     s.ia.shops = s.ia.shops || [];
     const shop = text.trim();
@@ -873,12 +935,13 @@ bot.on('text', async (ctx) => {
         parcels = await sbGet('parcels', `?track=eq.${text}`);
       }
       if (!parcels.length) return ctx.reply(`Нічого не знайдено: ${text}`);
-      const [clients, carriers] = await Promise.all([
+      const [clients, carriers, addresses] = await Promise.all([
         sbGet('clients', '?select=id,name,tg'),
-        sbGet('carriers', '?select=id,name')
+        sbGet('carriers', '?select=id,name'),
+        sbGet('addresses', '?select=id,name,street,house')
       ]);
       const p = parcels[0];
-      await ctx.reply(fmtParcel(p, clients, carriers), { parse_mode: 'Markdown', ...parcelActions(p) });
+      await ctx.reply(fmtParcel(p, clients, carriers, addresses), { parse_mode: 'Markdown', ...parcelActions(p) });
     } catch (e) { ctx.reply('Помилка: ' + e.message); }
     return;
   }
@@ -1064,24 +1127,72 @@ bot.action(/^ia_cl_(\d+)$/, async (ctx) => {
     const shops = [...shopSet].sort();
 
     s.ia.shopList = shops;
+    s.ia.shopPage = 0;
     s.step = null;
-
-    // Show shops as buttons (max 20) + manual input option
-    const rows = [];
-    for (let i = 0; i < Math.min(shops.length, 18); i += 2) {
-      const row = [Markup.button.callback(shops[i], `ia_sh_${i}`)];
-      if (shops[i+1]) row.push(Markup.button.callback(shops[i+1], `ia_sh_${i+1}`));
-      rows.push(row);
-    }
-    rows.push([Markup.button.callback('✏ Інший магазин', 'ia_sh_new')]);
-    rows.push([Markup.button.callback('« Назад', 'back_main')]);
-
-    await ctx.editMessageText(
-      `👤 ${cl.name}${cl.tg ? ' ' + cl.tg : ''}\n\nКрок 2 — Оберіть магазин:`,
-      Markup.inlineKeyboard(rows)
-    );
+    await iaShowShopMenu(ctx);
   } catch(e) { ctx.reply('Помилка: ' + e.message); }
 });
+
+async function iaShowShopMenu(ctx, filter = '') {
+  const s = sess(ctx);
+  const cl = s.ia.clientObj || {};
+  const shops = s.ia.shopList || [];
+  const PAGE = 16;
+  const page = s.ia.shopPage || 0;
+
+  let filtered = filter
+    ? shops.filter(sh => sh.toLowerCase().includes(filter.toLowerCase()))
+    : shops;
+
+  // If search found nothing — show similar (Levenshtein-ish: common chars)
+  let isApprox = false;
+  if (filter && !filtered.length) {
+    isApprox = true;
+    const fl = filter.toLowerCase();
+    filtered = shops.filter(sh => {
+      const sl = sh.toLowerCase();
+      // Check if at least half the filter chars appear in shop name
+      let hits = 0;
+      for (const ch of fl) if (sl.includes(ch)) hits++;
+      return hits >= Math.ceil(fl.length * 0.5);
+    }).slice(0, 8);
+  }
+
+  const total = filtered.length;
+  const page_shops = filtered.slice(page * PAGE, (page + 1) * PAGE);
+
+  const rows = [];
+  for (let i = 0; i < page_shops.length; i += 2) {
+    const globalIdx = shops.indexOf(page_shops[i]);
+    const row = [Markup.button.callback(page_shops[i], `ia_sh_${globalIdx}`)];
+    if (page_shops[i+1]) {
+      const globalIdx2 = shops.indexOf(page_shops[i+1]);
+      row.push(Markup.button.callback(page_shops[i+1], `ia_sh_${globalIdx2}`));
+    }
+    rows.push(row);
+  }
+
+  // Pagination
+  const navRow = [];
+  if (page > 0) navRow.push(Markup.button.callback('◀ Назад', 'ia_sh_page_prev'));
+  if ((page + 1) * PAGE < total) navRow.push(Markup.button.callback('▶ Далі', 'ia_sh_page_next'));
+  if (navRow.length) rows.push(navRow);
+
+  rows.push([Markup.button.callback('🔎 Пошук магазину', 'ia_sh_search')]);
+  rows.push([Markup.button.callback('✏ Інший магазин', 'ia_sh_new')]);
+  rows.push([Markup.button.callback('« Назад', 'back_main')]);
+
+  const header = filter
+    ? (isApprox
+      ? `🔍 Схожі на "${filter}" (${total}):\n\nКрок 2 — Оберіть або введіть інший:`
+      : `🔍 Результат для "${filter}" (${total}):\n\nКрок 2 — Оберіть магазин:`)
+    : `👤 ${s.ia.clientName}\n\nКрок 2 — Оберіть магазин (${total}):`;
+
+  try {
+    if (ctx.callbackQuery) await ctx.editMessageText(header, Markup.inlineKeyboard(rows));
+    else await ctx.reply(header, Markup.inlineKeyboard(rows));
+  } catch(e) { await ctx.reply(header, Markup.inlineKeyboard(rows)); }
+}
 
 // Shop selected from list
 bot.action(/^ia_sh_(\d+)$/, async (ctx) => {
@@ -1092,6 +1203,27 @@ bot.action(/^ia_sh_(\d+)$/, async (ctx) => {
   if (!shop) return ctx.reply('Помилка: магазин не знайдено');
   s.ia.shop = shop;
   await iaShowAddresses(ctx);
+});
+
+// Pagination
+bot.action('ia_sh_page_prev', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  s.ia.shopPage = Math.max(0, (s.ia.shopPage || 0) - 1);
+  await iaShowShopMenu(ctx, s.ia.shopFilter || '');
+});
+bot.action('ia_sh_page_next', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  s.ia.shopPage = (s.ia.shopPage || 0) + 1;
+  await iaShowShopMenu(ctx, s.ia.shopFilter || '');
+});
+
+// Search button
+bot.action('ia_sh_search', async (ctx) => {
+  await ctx.answerCbQuery();
+  sess(ctx).step = 'ia_shop_search';
+  await ctx.editMessageText('Введіть назву магазину для пошуку:');
 });
 
 // Manual shop input
