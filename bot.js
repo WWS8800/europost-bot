@@ -99,9 +99,7 @@ function fmtParcel(p, clients = [], carriers = [], addresses = []) {
   const cr = carriers.find(c => c.id === p.carrier_id) || { name: '' };
   const addr = addresses.find(a => a.id === p.addr_id);
   const st = STATUS[p.status] || { l: p.status, e: '📦' };
-  const addrShort = addr
-    ? `${addr.name}, ${addr.street} ${addr.house}`
-    : null;
+  const addrShort = addr ? addr.name : null;
   const lines = [
     `*${p.id}*`,
     `${st.e} ${st.l}`,
@@ -330,10 +328,11 @@ bot.hears(/^EU-\d+/i, async (ctx) => {
 
 async function showParcel(ctx, id) {
   try {
-    const [parcels, clients, carriers] = await Promise.all([
+    const [parcels, clients, carriers, addresses] = await Promise.all([
       sbGet('parcels', `?id=eq.${id}`),
       sbGet('clients', '?select=id,name,tg'),
       sbGet('carriers', '?select=id,name'),
+      sbGet('addresses', '?select=id,name,street,house'),
     ]);
     const p = parcels[0];
     if (!p) return ctx.reply(`Посилку ${id} не знайдено`);
@@ -442,13 +441,17 @@ bot.hears(/Знайти посилку/, async (ctx) => {
 
 async function showSearchMenu(ctx) {
   await ctx.reply('🔍 Знайти посилку:', Markup.inlineKeyboard([
-    [Markup.button.callback('🆕 Нові (issued)', 'srch_issued')],
-    [Markup.button.callback('📦 В дорозі (in_transit)', 'srch_in_transit')],
-    [Markup.button.callback('🏭 На складі ЄС (received)', 'srch_received')],
-    [Markup.button.callback('🏠 Отримано клієнтом (delivered)', 'srch_delivered')],
-    [Markup.button.callback('✅ Легіт (legit)', 'srch_legit')],
-    [Markup.button.callback('🚫 Скасовані (cancelled)', 'srch_cancelled')],
-    [Markup.button.callback('🔎 Пошук по ID / tracking', 'srch_manual')],
+    [Markup.button.callback('📋 Видана адреса',   'srch_issued')],
+    [Markup.button.callback('📦 Замовлено',        'srch_ordered')],
+    [Markup.button.callback('🏭 На складі ЄС',    'srch_warehouse')],
+    [Markup.button.callback('🏠 На адресі',        'srch_address')],
+    [Markup.button.callback('🚐 У перевізника',   'srch_carrier')],
+    [Markup.button.callback('📮 Відправлено НП',  'srch_np_sent')],
+    [Markup.button.callback('🇺🇦 В Україні',       'srch_ua')],
+    [Markup.button.callback('✅ Доставлено',       'srch_delivered')],
+    [Markup.button.callback('👑 Легіт',            'srch_legit')],
+    [Markup.button.callback('❌ Скасовано',        'srch_cancelled')],
+    [Markup.button.callback('🔎 По ID / tracking','srch_manual')],
   ]));
 }
 
