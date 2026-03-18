@@ -1022,20 +1022,19 @@ bot.on('text', async (ctx) => {
     await iaShowShopMenu(ctx, text);
     return;
   }
-  if (s.step === 'ia2_shops') {
-    s.ia.shops = s.ia.shops || [];
+  if (s.step === 'ia2_shop_search') {
+    s.step = null;
+    s.ia.shopFilter = text;
+    s.ia.shopPage = 0;
+    await iaShowShopMenu2(ctx, text);
+    return;
+  }
+  if (s.step === 'ia2_shop_manual') {
+    s.step = null;
     const shop = text.trim();
-    if (s.ia.shops.includes(shop)) {
-      await ctx.reply('⚠️ ' + shop + ' вже є в списку');
-    } else {
-      s.ia.shops.push(shop);
-      const list = s.ia.shops.map((s,i) => (i+1)+'. 🏪 '+s).join('\n');
-      await ctx.reply('Список магазинів ('+s.ia.shops.length+'):\n'+list, Markup.inlineKeyboard([
-        [Markup.button.callback('✔ Готово →', 'ia2_shops_done')],
-        [Markup.button.callback('❌ Видалити останній', 'ia2_shop_remove')],
-        [Markup.button.callback('« Скасувати', 'back_main')],
-      ]));
-    }
+    s.ia.shops = s.ia.shops || [];
+    if (!s.ia.shops.includes(shop)) s.ia.shops.push(shop);
+    await iaShowShopMenu2(ctx, s.ia.shopFilter || '');
     return;
   }
   if (s.step === 'ia_note') {
@@ -1219,7 +1218,7 @@ async function iaLoadClients(ctx, prefix) {
   await ctx.editMessageText('📍 Крок 1 — Оберіть клієнта:', Markup.inlineKeyboard(rows));
 }
 
-// Mode 2 — client selected → enter shops first
+// Mode 2 — client selected → show shop menu
 bot.action(/^ia2_cl_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const s = sess(ctx);
@@ -1228,13 +1227,123 @@ bot.action(/^ia2_cl_(\d+)$/, async (ctx) => {
   const cl = clients[0];
   s.ia.client_id = cId; s.ia.clientName = cl.name; s.ia.clientTg = cl.tg||'';
   s.ia.shops = [];
-  s.step = 'ia2_shops';
-  await ctx.editMessageText(
-    `👤 ${cl.name}\n\nКрок 2 — Введіть магазини по одному.\nКожне повідомлення = 1 магазин.\nСистема знайде адресу чисту для ВСІХ.\n\nСписок: (поки порожній)`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback('« Скасувати', 'back_main')],
-    ])
-  );
+  s.ia.shopPage = 0;
+  s.ia.shopFilter = '';
+  // Load shop list from DB
+  const [parcels, dirty] = await Promise.all([
+    sbGet('parcels', '?select=shop'),
+    sbGet('dirty_addresses', '?select=shop'),
+  ]);
+  const shopSet = new Set();
+  [...parcels, ...dirty].forEach(r => { if(r.shop) shopSet.add(r.shop.trim()); });
+  s.ia.shopList = [...shopSet].sort();
+  s.ia.ia2Mode = true; // flag: we're in mode 2
+  await iaShowShopMenu2(ctx);
+});
+
+// Mode 2 shop menu — same UI as mode 1 but tracks selected shops list
+async function iaShowShopMenu2(ctx, filter = '') {
+  const s = sess(ctx);
+  const shops = s.ia.shopList || [];
+  const selected = s.ia.shops || [];
+  const PAGE = 16;
+  const page = s.ia.shopPage || 0;
+
+  let filtered = filter
+    ? shops.filter(sh => sh.toLowerCase().includes(filter.toLowerCase()))
+    : shops;
+
+  let isApprox = false;
+  if (filter && !filtered.length) {
+    isApprox = true;
+    const fl = filter.toLowerCase();
+    filtered = shops.filter(sh => {
+      const sl = sh.toLowerCase();
+      let hits = 0;
+      for (const ch of fl) if (sl.includes(ch)) hits++;
+      return hits >= Math.ceil(fl.length * 0.5);
+    }).slice(0, 8);
+  }
+
+  const total = filtered.length;
+  const page_shops = filtered.slice(page * PAGE, (page + 1) * PAGE);
+  const rows = [];
+
+  for (let i = 0; i < page_shops.length; i += 2) {
+    const globalIdx = shops.indexOf(page_shops[i]);
+    const isSel1 = selected.includes(page_shops[i]);
+    const row = [Markup.button.callback((isSel1 ? '✅ ' : '') + page_shops[i], `ia2_sh_${globalIdx}`)];
+    if (page_shops[i+1]) {
+      const globalIdx2 = shops.indexOf(page_shops[i+1]);
+      const isSel2 = selected.includes(page_shops[i+1]);
+      row.push(Markup.button.callback((isSel2 ? '✅ ' : '') + page_shops[i+1], `ia2_sh_${globalIdx2}`));
+    }
+    rows.push(row);
+  }
+
+  const navRow = [];
+  if (page > 0) navRow.push(Markup.button.callback('◀', 'ia2_sh_page_prev'));
+  if ((page + 1) * PAGE < total) navRow.push(Markup.button.callback('▶', 'ia2_sh_page_next'));
+  if (navRow.length) rows.push(navRow);
+
+  rows.push([Markup.button.callback('🔎 Пошук магазину', 'ia2_sh_search')]);
+  rows.push([Markup.button.callback('✏ Інший магазин', 'ia2_sh_new')]);
+
+  if (selected.length > 0) {
+    rows.push([Markup.button.callback(`✔ Готово (${selected.length} обрано) →`, 'ia2_shops_done')]);
+  }
+  rows.push([Markup.button.callback('« Назад', 'back_main')]);
+
+  const selList = selected.length ? '\n\nОбрано: ' + selected.map((s,i)=>(i+1)+'. '+s).join(', ') : '';
+  const header = filter
+    ? (isApprox
+      ? `🔍 Схожі на "${filter}" (${total}):${selList}`
+      : `🔍 Результат для "${filter}" (${total}):${selList}`)
+    : `👤 ${s.ia.clientName}\n\nКрок 2 — Оберіть магазини (${total}):\n(можна вибрати кілька)${selList}`;
+
+  try {
+    if (ctx.callbackQuery) await ctx.editMessageText(header, Markup.inlineKeyboard(rows));
+    else await ctx.reply(header, Markup.inlineKeyboard(rows));
+  } catch(e) { await ctx.reply(header, Markup.inlineKeyboard(rows)); }
+}
+
+// Toggle shop in mode 2
+bot.action(/^ia2_sh_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  const idx = parseInt(ctx.match[1]);
+  const shop = (s.ia.shopList || [])[idx];
+  if (!shop) return;
+  s.ia.shops = s.ia.shops || [];
+  const pos = s.ia.shops.indexOf(shop);
+  if (pos === -1) s.ia.shops.push(shop);
+  else s.ia.shops.splice(pos, 1);
+  await iaShowShopMenu2(ctx, s.ia.shopFilter || '');
+});
+
+bot.action('ia2_sh_page_prev', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  s.ia.shopPage = Math.max(0, (s.ia.shopPage||0) - 1);
+  await iaShowShopMenu2(ctx, s.ia.shopFilter || '');
+});
+bot.action('ia2_sh_page_next', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  s.ia.shopPage = (s.ia.shopPage||0) + 1;
+  await iaShowShopMenu2(ctx, s.ia.shopFilter || '');
+});
+
+bot.action('ia2_sh_search', async (ctx) => {
+  await ctx.answerCbQuery();
+  sess(ctx).step = 'ia2_shop_search';
+  await ctx.editMessageText('Введіть назву магазину для пошуку:');
+});
+
+bot.action('ia2_sh_new', async (ctx) => {
+  await ctx.answerCbQuery();
+  sess(ctx).step = 'ia2_shop_manual';
+  await ctx.editMessageText('Введіть назву магазину:');
 });
 
 // Step 1 — client selected → show shops
@@ -1468,12 +1577,7 @@ bot.action('ia2_shop_remove', async (ctx) => {
   const s = sess(ctx);
   s.ia.shops = s.ia.shops || [];
   if (s.ia.shops.length) s.ia.shops.pop();
-  const list = s.ia.shops.length ? s.ia.shops.map((sh,i)=>(i+1)+'. 🏪 '+sh).join('\n') : '(порожній)';
-  await ctx.editMessageText('Список магазинів ('+s.ia.shops.length+'):\n'+list, Markup.inlineKeyboard([
-    [Markup.button.callback('✔ Готово →','ia2_shops_done')],
-    [Markup.button.callback('❌ Видалити останній','ia2_shop_remove')],
-    [Markup.button.callback('« Скасувати','back_main')],
-  ]));
+  await iaShowShopMenu2(ctx, s.ia.shopFilter || '');
 });
 
 // Mode 2 — shops done → find matching addresses
@@ -1622,20 +1726,23 @@ async function iaFinalize(ctx, note) {
     }
 
     const lines = [
-      '✅ Видано ' + created.length + ' адрес!',
-      '',
+      '✅ Видано ' + created.length + ' посилок!',
       '👤 ' + ia.clientName + (ia.clientTg ? ' ' + ia.clientTg : ''),
       '🏪 ' + ia.shop,
       '📋 ' + ia.method,
       note ? '📝 ' + note : null,
       '',
     ];
-    created.forEach((c, i) => {
+    created.forEach((c) => {
       const a = c.addr;
-      lines.push('─── ' + c.id + ' ───');
+      lines.push('━━━━━━━━━━━━━━━━━');
+      lines.push('📦 ' + c.id);
+      lines.push('');
+      lines.push('📍 АДРЕСА ДЛЯ ЗАМОВЛЕННЯ:');
       lines.push(a.name);
       lines.push(a.street + ' ' + a.house + (a.door ? ', ' + a.door : ''));
       lines.push((a.zip || '') + ' ' + (a.city || ''));
+      if (a.country) lines.push(a.country);
       if (a.phone) lines.push('Tel: ' + a.phone);
       lines.push('');
     });
@@ -1674,15 +1781,15 @@ async function iaFinalize2(ctx, note) {
           shop, date: todayISO, status: 'issued',
           price: 0, ship_cost: 0, paid1: false, paid2: false, note: note||'',
         });
-        created.push({ id: newId, shop, addrName: a.name });
+        created.push({ id: newId, shop, addrId: a.id, addrObj: a });
       }
     }
 
-    // Group output by address
-    const byAddr = {};
+    // Group output by address object
+    const byAddrId = {};
     created.forEach(c => {
-      if (!byAddr[c.addrName]) byAddr[c.addrName] = [];
-      byAddr[c.addrName].push(c);
+      if (!byAddrId[c.addrId]) byAddrId[c.addrId] = { addr: c.addrObj, parcels: [] };
+      byAddrId[c.addrId].parcels.push(c);
     });
 
     const lines = [
@@ -1692,9 +1799,17 @@ async function iaFinalize2(ctx, note) {
       note ? `📝 ${note}` : null,
       '',
     ];
-    Object.entries(byAddr).forEach(([addr, parcels]) => {
-      lines.push(`📍 ${addr}:`);
-      parcels.forEach(c => lines.push(`  • ${c.id} — ${c.shop}`));
+    Object.values(byAddrId).forEach(({ addr, parcels }) => {
+      lines.push('━━━━━━━━━━━━━━━━━');
+      lines.push('📍 АДРЕСА ДЛЯ ЗАМОВЛЕННЯ:');
+      lines.push(addr.name);
+      lines.push(addr.street + ' ' + addr.house + (addr.door ? ', ' + addr.door : ''));
+      lines.push((addr.zip || '') + ' ' + (addr.city || ''));
+      if (addr.country) lines.push(addr.country);
+      if (addr.phone) lines.push('Tel: ' + addr.phone);
+      lines.push('');
+      lines.push('Посилки під цю адресу:');
+      parcels.forEach(c => lines.push(`• ${c.id} — ${c.shop}`));
       lines.push('');
     });
 
