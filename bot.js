@@ -1509,29 +1509,71 @@ bot.action('ia2_shops_done', async (ctx) => {
     }
 
     s.ia.matchingAddrs = matching;
-    const rows = matching.map(a => [Markup.button.callback(
-      a.name + ' — ' + a.street + ' ' + a.house + ', ' + a.city, `ia2_ad_${a.id}`
-    )]);
-    rows.push([Markup.button.callback('« Назад','back_main')]);
-
-    await ctx.editMessageText(
-      `✅ Підходить для всіх ${s.ia.shops.length} магазинів: ${matching.length} адрес\n\nКрок 3 — Оберіть адресу:`,
-      Markup.inlineKeyboard(rows)
-    );
+    s.ia.selectedAddrs2 = []; // multi-select
+    await ia2SendAddrList(ctx);
   } catch(e) { ctx.reply('Помилка: ' + e.message); }
 });
 
-// Mode 2 — address selected from smart search → method
+// Mode 2 — render address multi-select list
+async function ia2SendAddrList(ctx) {
+  const s = sess(ctx);
+  const matching = s.ia.matchingAddrs || [];
+  const selected = s.ia.selectedAddrs2 || [];
+
+  const rows = matching.map(a => {
+    const isSel = selected.includes(a.id);
+    const label = (isSel ? '✅ ' : '☐ ') + a.name + ' — ' + a.street + ' ' + a.house + ', ' + a.city;
+    return [Markup.button.callback(label.slice(0, 60), `ia2_ad_${a.id}`)];
+  });
+
+  const cnt = selected.length;
+  const shops = s.ia.shops.length;
+  const total = cnt * shops;
+
+  if (cnt > 0) {
+    rows.push([Markup.button.callback(`✔ Далі (${cnt} адрес × ${shops} магазинів = ${total} посилок) →`, 'ia2_addr_done')]);
+  }
+  rows.push([Markup.button.callback('« Назад', 'back_main')]);
+
+  const text = `👤 ${s.ia.clientName}
+🏪 Магазини (${shops}): ${s.ia.shops.join(', ')}
+
+✅ Підходить для всіх магазинів: ${matching.length} адрес
+${cnt ? '☑ Обрано: ' + cnt : ''}
+
+Крок 3 — Оберіть адреси (можна кілька):`;
+  try {
+    if (ctx.callbackQuery) await ctx.editMessageText(text, Markup.inlineKeyboard(rows));
+    else await ctx.reply(text, Markup.inlineKeyboard(rows));
+  } catch(e) { await ctx.reply(text, Markup.inlineKeyboard(rows)); }
+}
+
+// Mode 2 — toggle address selection
 bot.action(/^ia2_ad_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const s = sess(ctx);
   const aId = parseInt(ctx.match[1]);
-  s.ia.addrId = aId;
-  s.ia.addrObj = (s.ia.matchingAddrs||[]).find(a=>a.id===aId);
-  if (!s.ia.addrObj) return ctx.reply('Адресу не знайдено');
-  const a = s.ia.addrObj;
+  s.ia.selectedAddrs2 = s.ia.selectedAddrs2 || [];
+  const idx = s.ia.selectedAddrs2.indexOf(aId);
+  if (idx === -1) s.ia.selectedAddrs2.push(aId);
+  else s.ia.selectedAddrs2.splice(idx, 1);
+  await ia2SendAddrList(ctx);
+});
+
+// Mode 2 — done selecting addresses → method
+bot.action('ia2_addr_done', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  if (!s.ia.selectedAddrs2?.length) return ctx.answerCbQuery('Оберіть хоча б одну адресу!');
+  const cnt = s.ia.selectedAddrs2.length;
+  const shops = s.ia.shops.length;
   await ctx.editMessageText(
-    `👤 ${s.ia.clientName}\n📍 ${a.name} — ${a.street} ${a.house}, ${a.city}\n🏪 Магазинів: ${s.ia.shops.length}\n\nКрок 4 — Оберіть метод:`,
+    `👤 ${s.ia.clientName}
+📍 Адрес: ${cnt}
+🏪 Магазинів: ${shops}
+📦 Буде створено: ${cnt * shops} посилок
+
+Крок 4 — Оберіть метод:`,
     Markup.inlineKeyboard([
       [Markup.button.callback('FTID','ia2_mt_FTID'), Markup.button.callback('RTS','ia2_mt_RTS')],
       [Markup.button.callback('DAMAGE','ia2_mt_DAMAGE'), Markup.button.callback('DNA','ia2_mt_DNA')],
@@ -1609,39 +1651,52 @@ async function iaFinalize(ctx, note) {
 async function iaFinalize2(ctx, note) {
   const s = sess(ctx);
   const ia = s.ia;
-  const a = ia.addrObj;
   const today = new Date().toLocaleDateString('uk-UA');
   const todayISO = new Date().toISOString().split('T')[0];
-  const addrKey = a.name + ' ' + a.street + ' ' + a.house;
-  const created = [];
+  const created = []; // { id, shop, addrName }
 
   try {
-    for (const shop of (ia.shops || [])) {
-      await sbPost('dirty_addresses', {
-        addr: addrKey, shop, tg: ia.clientTg,
-        date: today, method: ia.method, note: note||'',
-      });
-      await new Promise(r => setTimeout(r, 5));
-      const newId = 'EU-' + String(Date.now()).slice(-6);
-      await sbPost('parcels', {
-        id: newId, client_id: ia.client_id, addr_id: ia.addrId,
-        shop, date: todayISO, status: 'issued',
-        price: 0, ship_cost: 0, paid1: false, paid2: false, note: note||'',
-      });
-      created.push({ id: newId, shop });
+    // Loop every address × every shop
+    for (const addrId of (ia.selectedAddrs2 || [])) {
+      const a = (ia.matchingAddrs || []).find(x => x.id === addrId);
+      if (!a) continue;
+      const addrKey = a.name + ' ' + a.street + ' ' + a.house;
+
+      for (const shop of (ia.shops || [])) {
+        await sbPost('dirty_addresses', {
+          addr: addrKey, shop, tg: ia.clientTg,
+          date: today, method: ia.method, note: note||'',
+        });
+        await new Promise(r => setTimeout(r, 5));
+        const newId = 'EU-' + String(Date.now()).slice(-6);
+        await sbPost('parcels', {
+          id: newId, client_id: ia.client_id, addr_id: addrId,
+          shop, date: todayISO, status: 'issued',
+          price: 0, ship_cost: 0, paid1: false, paid2: false, note: note||'',
+        });
+        created.push({ id: newId, shop, addrName: a.name });
+      }
     }
 
+    // Group output by address
+    const byAddr = {};
+    created.forEach(c => {
+      if (!byAddr[c.addrName]) byAddr[c.addrName] = [];
+      byAddr[c.addrName].push(c);
+    });
+
     const lines = [
-      '✅ Видано ' + created.length + ' посилок!',
-      '',
-      '👤 ' + ia.clientName + (ia.clientTg?' '+ia.clientTg:''),
-      '📍 ' + addrKey + ', ' + (a.zip||'') + ' ' + (a.city||''),
-      a.phone ? 'Tel: ' + a.phone : null,
-      '📋 ' + ia.method,
-      note ? '📝 ' + note : null,
+      `✅ Видано ${created.length} посилок!`,
+      `👤 ${ia.clientName}${ia.clientTg?' '+ia.clientTg:''}`,
+      `📋 ${ia.method}`,
+      note ? `📝 ${note}` : null,
       '',
     ];
-    created.forEach(c => lines.push('• ' + c.id + ' — ' + c.shop));
+    Object.entries(byAddr).forEach(([addr, parcels]) => {
+      lines.push(`📍 ${addr}:`);
+      parcels.forEach(c => lines.push(`  • ${c.id} — ${c.shop}`));
+      lines.push('');
+    });
 
     s.ia = {}; s.step = null;
     await ctx.reply(lines.filter(l=>l!==null).join('\n'), mainMenu());
