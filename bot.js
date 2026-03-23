@@ -562,7 +562,7 @@ bot.action(/^srch_(.+)$/, async (ctx) => {
 
   try {
     const [parcels, clients, addresses] = await Promise.all([
-      sbGet('parcels', `?status=eq.${key}&order=date.desc&limit=30&select=id,client_id,shop,date,status,track,price,ship_cost,paid1,paid2,addr_id,note`),
+      sbGet('parcels', `?status=eq.${key}&order=date.desc&limit=50&select=id,client_id,shop,date,status,track,price,ship_cost,paid1,paid2,addr_id,note`),
       sbGet('clients', '?select=id,name,tg'),
       sbGet('addresses', '?select=id,name,street,house'),
     ]);
@@ -1482,16 +1482,25 @@ async function iaShowAddresses(ctx) {
     ]);
 
     const shopLower = (s.ia.shop || '').trim().toLowerCase();
+
+    // Normalize: collapse multiple spaces, trim
+    const norm = str => (str || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
     const usedSet = new Set(
       allDirty
-        .filter(d => (d.shop || '').trim().toLowerCase() === shopLower)
-        .map(d => (d.addr || '').trim().toLowerCase())
+        .filter(d => norm(d.shop) === shopLower)
+        .map(d => norm(d.addr))
     );
 
     const free = allAddrs.filter(a => {
-      const key = (a.name + ' ' + a.street + ' ' + a.house).trim().toLowerCase();
+      // Build addr key same way as it's saved
+      const key = norm((a.name||'') + ' ' + (a.street||'') + ' ' + (a.house||''));
       return a.status === 'free' && !usedSet.has(key);
     });
+
+    // Debug log to help track issues
+    console.log(`[iaShowAddresses] shop="${s.ia.shop}" usedSet(${usedSet.size}):`, [...usedSet].slice(0,3));
+    console.log(`[iaShowAddresses] free: ${free.length}/${allAddrs.length}`);
 
     s.ia.freeAddrs = free;
     s.ia.selectedAddrs = s.ia.selectedAddrs || [];
@@ -1593,14 +1602,16 @@ bot.action('ia2_shops_done', async (ctx) => {
       sbGet('dirty_addresses', '?select=addr,shop'),
     ]);
 
+    const norm2 = str => (str || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
     // Find addresses clean for ALL shops simultaneously
     const matching = allAddrs.filter(a => {
-      const addrKey = (a.name + ' ' + a.street + ' ' + a.house).trim().toLowerCase();
-      return s.ia.shops.every(shop => {
-        const shopLow = shop.trim().toLowerCase();
+      const addrKey = norm2((a.name||'')+' '+(a.street||'')+' '+(a.house||''));
+      return a.status === 'free' && s.ia.shops.every(shop => {
+        const shopLow = norm2(shop);
         return !allDirty.some(d =>
-          (d.addr||'').trim().toLowerCase() === addrKey &&
-          (d.shop||'').trim().toLowerCase() === shopLow
+          norm2(d.addr) === addrKey &&
+          norm2(d.shop) === shopLow
         );
       });
     });
@@ -1710,7 +1721,7 @@ async function iaFinalize(ctx, note) {
       if (!a) continue;
 
       await sbPost('dirty_addresses', {
-        addr: a.name + ' ' + a.street + ' ' + a.house,
+        addr: ((a.name||'')+' '+(a.street||'')+' '+(a.house||'')).replace(/\s+/g,' ').trim(),
         shop: ia.shop, tg: ia.clientTg,
         date: today, method: ia.method, note: note || '',
       });
@@ -1767,7 +1778,7 @@ async function iaFinalize2(ctx, note) {
     for (const addrId of (ia.selectedAddrs2 || [])) {
       const a = (ia.matchingAddrs || []).find(x => x.id === addrId);
       if (!a) continue;
-      const addrKey = a.name + ' ' + a.street + ' ' + a.house;
+      const addrKey = ((a.name||'')+' '+(a.street||'')+' '+(a.house||'')).replace(/\s+/g,' ').trim();
 
       for (const shop of (ia.shops || [])) {
         await sbPost('dirty_addresses', {
