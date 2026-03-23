@@ -1602,100 +1602,216 @@ bot.action('ia2_shops_done', async (ctx) => {
       sbGet('dirty_addresses', '?select=addr,shop'),
     ]);
 
-    const norm2 = str => (str || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const norm2 = str => (str||'').replace(/\s+/g,' ').trim().toLowerCase();
+    s.ia.allAddrs = allAddrs;
 
-    // Find addresses clean for ALL shops simultaneously
-    const matching = allAddrs.filter(a => {
-      const addrKey = norm2((a.name||'')+' '+(a.street||'')+' '+(a.house||''));
-      return a.status === 'free' && s.ia.shops.every(shop => {
-        const shopLow = norm2(shop);
-        return !allDirty.some(d =>
-          norm2(d.addr) === addrKey &&
-          norm2(d.shop) === shopLow
-        );
-      });
-    });
-
-    if (!matching.length) {
-      return ctx.editMessageText(
-        `⚠️ Немає адреси чистої для всіх ${s.ia.shops.length} магазинів одночасно!\n\nСпробуй зменшити список.`,
-        Markup.inlineKeyboard([[Markup.button.callback('« Назад','back_main')]])
+    // For each shop build set of free addr ids
+    const shopFreeMap = {};
+    for (const shop of s.ia.shops) {
+      const shopLow = norm2(shop);
+      const usedKeys = new Set(
+        allDirty
+          .filter(d => norm2(d.shop) === shopLow)
+          .map(d => norm2(d.addr))
+      );
+      shopFreeMap[shop] = new Set(
+        allAddrs
+          .filter(a => !usedKeys.has(norm2((a.name||'')+' '+(a.street||'')+' '+(a.house||''))))
+          .map(a => a.id)
       );
     }
+    s.ia.shopFreeMap = shopFreeMap;
 
-    s.ia.matchingAddrs = matching;
-    s.ia.selectedAddrs2 = []; // multi-select
-    await ia2SendAddrList(ctx);
+    // Step 1: try to find ONE address clean for ALL shops
+    const commonAddrs = allAddrs.filter(a =>
+      s.ia.shops.every(shop => shopFreeMap[shop].has(a.id))
+    );
+
+    if (commonAddrs.length > 0) {
+      // Happy path — show common addresses, user picks one
+      s.ia.commonMode = true;
+      s.ia.commonAddrs = commonAddrs;
+      const rows = commonAddrs.map(a => [
+        Markup.button.callback(
+          a.name + ' — ' + a.street + ' ' + a.house + ', ' + a.city,
+          `ia2_common_${a.id}`
+        )
+      ]);
+      rows.push([Markup.button.callback('🔀 Призначити по-різному', 'ia2_use_pairs')]);
+      rows.push([Markup.button.callback('« Назад', 'back_main')]);
+
+      const shopList = s.ia.shops.map((sh,i) => `${i+1}. ${sh}`).join('\n');
+      await ia2Edit(ctx,
+        `👤 ${s.ia.clientName}\n\n🏪 Магазини:\n${shopList}\n\n✅ Є ${commonAddrs.length} адрес чистих для всіх — оберіть одну:`,
+        rows
+      );
+    } else {
+      // No common address — go to pair mode
+      s.ia.commonMode = false;
+      s.ia.pairs = s.ia.shops.map(() => null);
+      s.ia.pairStep = 0;
+      const shopList = s.ia.shops.map((sh,i) => `${i+1}. ${sh}`).join('\n');
+      await ia2Edit(ctx,
+        `👤 ${s.ia.clientName}\n\n🏪 Магазини:\n${shopList}\n\n⚠️ Немає однієї адреси чистої для всіх.\nПризначимо кожному магазину окремо:`,
+        [[Markup.button.callback('▶ Почати призначення', 'ia2_start_pairs')], [Markup.button.callback('« Назад', 'back_main')]]
+      );
+    }
   } catch(e) { ctx.reply('Помилка: ' + e.message); }
 });
 
-// Mode 2 — render address multi-select list
-async function ia2SendAddrList(ctx) {
+// Common address selected — assign same to all shops
+bot.action(/^ia2_common_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
   const s = sess(ctx);
-  const matching = s.ia.matchingAddrs || [];
-  const selected = s.ia.selectedAddrs2 || [];
+  const addrId = parseInt(ctx.match[1]);
+  // Set same addr for all shops
+  s.ia.pairs = s.ia.shops.map(() => addrId);
+  const a = (s.ia.allAddrs||[]).find(x => x.id === addrId);
+  const shopList = s.ia.shops.map((sh,i) => `✅ ${sh} → ${a?a.name:'?'}`).join('\n');
+  await ia2Edit(ctx,
+    `👤 ${s.ia.clientName}\n\n${shopList}\n\n📦 Буде створено: ${s.ia.shops.length} посилок\n\nКрок 4 — Оберіть метод:`,
+    [
+      [Markup.button.callback('FTID','ia2_mt_FTID'), Markup.button.callback('RTS','ia2_mt_RTS')],
+      [Markup.button.callback('DAMAGE','ia2_mt_DAMAGE'), Markup.button.callback('DNA','ia2_mt_DNA')],
+      [Markup.button.callback('Зберігаємо','ia2_mt_Зберігаємо')],
+      [Markup.button.callback('« Назад','back_main')],
+    ]
+  );
+});
 
-  const rows = matching.map(a => {
-    const isSel = selected.includes(a.id);
-    const label = (isSel ? '✅ ' : '☐ ') + a.name + ' — ' + a.street + ' ' + a.house + ', ' + a.city;
-    return [Markup.button.callback(label.slice(0, 60), `ia2_ad_${a.id}`)];
-  });
+// User chose to assign different addresses despite common ones existing
+bot.action('ia2_use_pairs', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  s.ia.pairs = s.ia.shops.map(() => null);
+  s.ia.pairStep = 0;
+  await ia2ShowPairStep(ctx);
+});
 
-  const cnt = selected.length;
-  const shops = s.ia.shops.length;
-  const total = cnt * shops;
+// Start pair assignment after "no common" message
+bot.action('ia2_start_pairs', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sess(ctx);
+  s.ia.pairStep = 0;
+  await ia2ShowPairStep(ctx);
+});
 
-  if (cnt > 0) {
-    rows.push([Markup.button.callback(`✔ Далі (${cnt} адрес × ${shops} магазинів = ${total} посилок) →`, 'ia2_addr_done')]);
+// Show address picker for current shop in pair assignment
+async function ia2ShowPairStep(ctx) {
+  const s = sess(ctx);
+  const shopIdx = s.ia.pairStep;
+  const shop = s.ia.shops[shopIdx];
+  const freeIds = s.ia.shopFreeMap[shop];
+  const allAddrs = s.ia.allAddrs || [];
+
+  const freeAddrs = allAddrs.filter(a => freeIds.has(a.id));
+
+  // Show already assigned pairs summary
+  const done = s.ia.pairs.filter(p => p !== null).length;
+  const summary = done > 0
+    ? s.ia.shops.slice(0, shopIdx).map((sh, i) => {
+        const a = allAddrs.find(x => x.id === s.ia.pairs[i]);
+        return `✅ ${sh} → ${a ? a.name : '?'}`;
+      }).join('\n') + '\n\n'
+    : '';
+
+  if (!freeAddrs.length) {
+    // No free address for this shop — skip or go back
+    const rows = [
+      [Markup.button.callback('⏭ Пропустити цей магазин', `ia2_pair_skip_${shopIdx}`)],
+      [Markup.button.callback('« Назад', 'back_main')],
+    ];
+    await ia2Edit(ctx,
+      `${summary}🏪 ${shop}\n\n⚠️ Немає вільних адрес для цього магазину!`,
+      rows
+    );
+    return;
   }
+
+  const rows = freeAddrs.map(a =>
+    [Markup.button.callback(
+      a.name + ' — ' + a.street + ' ' + a.house + ', ' + a.city,
+      `ia2_pair_${shopIdx}_${a.id}`
+    )]
+  );
   rows.push([Markup.button.callback('« Назад', 'back_main')]);
 
-  const text = `👤 ${s.ia.clientName}
-🏪 Магазини (${shops}): ${s.ia.shops.join(', ')}
+  await ia2Edit(ctx,
+    `${summary}🏪 ${shop} (${shopIdx+1}/${s.ia.shops.length})\n\nВільних адрес: ${freeAddrs.length}\nОберіть адресу:`,
+    rows
+  );
+}
 
-✅ Підходить для всіх магазинів: ${matching.length} адрес
-${cnt ? '☑ Обрано: ' + cnt : ''}
-
-Крок 3 — Оберіть адреси (можна кілька):`;
+async function ia2Edit(ctx, text, rows) {
   try {
     if (ctx.callbackQuery) await ctx.editMessageText(text, Markup.inlineKeyboard(rows));
     else await ctx.reply(text, Markup.inlineKeyboard(rows));
   } catch(e) { await ctx.reply(text, Markup.inlineKeyboard(rows)); }
 }
 
-// Mode 2 — toggle address selection
-bot.action(/^ia2_ad_(\d+)$/, async (ctx) => {
+// Pair selected
+bot.action(/^ia2_pair_(\d+)_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const s = sess(ctx);
-  const aId = parseInt(ctx.match[1]);
-  s.ia.selectedAddrs2 = s.ia.selectedAddrs2 || [];
-  const idx = s.ia.selectedAddrs2.indexOf(aId);
-  if (idx === -1) s.ia.selectedAddrs2.push(aId);
-  else s.ia.selectedAddrs2.splice(idx, 1);
-  await ia2SendAddrList(ctx);
+  const shopIdx = parseInt(ctx.match[1]);
+  const addrId = parseInt(ctx.match[2]);
+  s.ia.pairs[shopIdx] = addrId;
+
+  // Next shop
+  const nextIdx = s.ia.shops.findIndex((_, i) => i > shopIdx && s.ia.pairs[i] === null);
+  if (nextIdx === -1) {
+    // All assigned — show confirmation and go to method
+    const allAddrs = s.ia.allAddrs || [];
+    const summary = s.ia.shops.map((sh, i) => {
+      const a = allAddrs.find(x => x.id === s.ia.pairs[i]);
+      return `✅ ${sh} → ${a ? a.name : '—'}`;
+    }).join('\n');
+    await ia2Edit(ctx,
+      `👤 ${s.ia.clientName}\n\n${summary}\n\n📦 Буде створено: ${s.ia.shops.filter((_,i)=>s.ia.pairs[i]).length} посилок\n\nКрок 4 — Оберіть метод:`,
+      [
+        [Markup.button.callback('FTID','ia2_mt_FTID'), Markup.button.callback('RTS','ia2_mt_RTS')],
+        [Markup.button.callback('DAMAGE','ia2_mt_DAMAGE'), Markup.button.callback('DNA','ia2_mt_DNA')],
+        [Markup.button.callback('Зберігаємо','ia2_mt_Зберігаємо')],
+        [Markup.button.callback('« Назад','back_main')],
+      ]
+    );
+  } else {
+    s.ia.pairStep = nextIdx;
+    await ia2ShowPairStep(ctx);
+  }
 });
 
-// Mode 2 — done selecting addresses → method
-bot.action('ia2_addr_done', async (ctx) => {
+// Skip shop (no free address)
+bot.action(/^ia2_pair_skip_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const s = sess(ctx);
-  if (!s.ia.selectedAddrs2?.length) return ctx.answerCbQuery('Оберіть хоча б одну адресу!');
-  const cnt = s.ia.selectedAddrs2.length;
-  const shops = s.ia.shops.length;
-  await ctx.editMessageText(
-    `👤 ${s.ia.clientName}
-📍 Адрес: ${cnt}
-🏪 Магазинів: ${shops}
-📦 Буде створено: ${cnt * shops} посилок
+  const shopIdx = parseInt(ctx.match[1]);
+  s.ia.pairs[shopIdx] = null; // keep null = skip
 
-Крок 4 — Оберіть метод:`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback('FTID','ia2_mt_FTID'), Markup.button.callback('RTS','ia2_mt_RTS')],
-      [Markup.button.callback('DAMAGE','ia2_mt_DAMAGE'), Markup.button.callback('DNA','ia2_mt_DNA')],
-      [Markup.button.callback('Зберігаємо','ia2_mt_Зберігаємо')],
-      [Markup.button.callback('« Назад','back_main')],
-    ])
-  );
+  const nextIdx = s.ia.shops.findIndex((_, i) => i > shopIdx && s.ia.pairs[i] === null);
+  if (nextIdx === -1) {
+    // All done
+    const assigned = s.ia.shops.filter((_, i) => s.ia.pairs[i] !== null).length;
+    if (!assigned) return ctx.reply('Немає жодної пари магазин+адреса. Скасовано.', mainMenu());
+    const allAddrs = s.ia.allAddrs || [];
+    const summary = s.ia.shops.map((sh, i) => {
+      if (!s.ia.pairs[i]) return `⏭ ${sh} — пропущено`;
+      const a = allAddrs.find(x => x.id === s.ia.pairs[i]);
+      return `✅ ${sh} → ${a ? a.name : '—'}`;
+    }).join('\n');
+    await ia2Edit(ctx,
+      `👤 ${s.ia.clientName}\n\n${summary}\n\nКрок 4 — Оберіть метод:`,
+      [
+        [Markup.button.callback('FTID','ia2_mt_FTID'), Markup.button.callback('RTS','ia2_mt_RTS')],
+        [Markup.button.callback('DAMAGE','ia2_mt_DAMAGE'), Markup.button.callback('DNA','ia2_mt_DNA')],
+        [Markup.button.callback('Зберігаємо','ia2_mt_Зберігаємо')],
+        [Markup.button.callback('« Назад','back_main')],
+      ]
+    );
+  } else {
+    s.ia.pairStep = nextIdx;
+    await ia2ShowPairStep(ctx);
+  }
 });
 
 // Mode 2 — method selected → note
@@ -1771,29 +1887,32 @@ async function iaFinalize2(ctx, note) {
   const ia = s.ia;
   const today = new Date().toLocaleDateString('uk-UA');
   const todayISO = new Date().toISOString().split('T')[0];
-  const created = []; // { id, shop, addrName }
+  const created = [];
 
   try {
-    // Loop every address × every shop
-    for (const addrId of (ia.selectedAddrs2 || [])) {
-      const a = (ia.matchingAddrs || []).find(x => x.id === addrId);
+    const allAddrs = ia.allAddrs || [];
+
+    // Loop pairs: pairs[i] = addrId for shops[i]
+    for (let i = 0; i < (ia.shops || []).length; i++) {
+      const addrId = (ia.pairs || [])[i];
+      if (!addrId) continue; // skipped
+      const shop = ia.shops[i];
+      const a = allAddrs.find(x => x.id === addrId);
       if (!a) continue;
       const addrKey = ((a.name||'')+' '+(a.street||'')+' '+(a.house||'')).replace(/\s+/g,' ').trim();
 
-      for (const shop of (ia.shops || [])) {
-        await sbPost('dirty_addresses', {
-          addr: addrKey, shop, tg: ia.clientTg,
-          date: today, method: ia.method, note: note||'',
-        });
-        await new Promise(r => setTimeout(r, 5));
-        const newId = 'EU-' + String(Date.now()).slice(-6);
-        await sbPost('parcels', {
-          id: newId, client_id: ia.client_id, addr_id: addrId,
-          shop, date: todayISO, status: 'issued',
-          price: 0, ship_cost: 0, paid1: false, paid2: false, note: note||'',
-        });
-        created.push({ id: newId, shop, addrId: a.id, addrObj: a });
-      }
+      await sbPost('dirty_addresses', {
+        addr: addrKey, shop, tg: ia.clientTg,
+        date: today, method: ia.method, note: note||'',
+      });
+      await new Promise(r => setTimeout(r, 5));
+      const newId = 'EU-' + String(Date.now()).slice(-6);
+      await sbPost('parcels', {
+        id: newId, client_id: ia.client_id, addr_id: addrId,
+        shop, date: todayISO, status: 'issued',
+        price: 0, ship_cost: 0, paid1: false, paid2: false, note: note||'',
+      });
+      created.push({ id: newId, shop, addrId: a.id, addrObj: a });
     }
 
     // Group output by address object
